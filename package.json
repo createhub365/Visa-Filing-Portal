@@ -1,0 +1,10 @@
+{
+  "name": "visa-filing-portal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Visa Filing Portal - Cloudflare Worker + static frontend (no build step)",
+  "scripts": {
+    "build": "echo \"No build step: static/ is served as-is\"",
+    "deploy": "wrangler deploy"
+  }
+}
