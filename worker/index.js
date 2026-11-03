@@ -32,6 +32,8 @@ const STAGES = [
   'Visa Rejected',
 ];
 
+const AI_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+
 const APPLICANT_TYPES = { salaried: 'Salaried person', business: 'Businessman / Self-employed' };
 
 // ------------------------------------------------------------------ errors --
@@ -527,6 +529,55 @@ const handlers = {
     return { ok: true };
   },
 
+  // Streams the model's answer (server-sent events) so the builder can add documents as they arrive.
+  // Output format, one per line: "- Document name | short instruction"
+  async aiChecklist(ctx) {
+    must(ctx.env.AI, 500, 'Workers AI is not enabled for this Worker');
+    const b = await ctx.json();
+    const key = checklistKey(b);
+    const library = (await ctx.sb.select('doc_types', { select: 'name', order: 'name' })).map(d => d.name);
+    const existing = (Array.isArray(b.existing) ? b.existing : []).map(str).filter(Boolean).slice(0, 100);
+    const applicant = APPLICANT_TYPES[key.applicant_type];
+    const system = [
+      'You are a senior visa documentation consultant at an Indian visa filing agency.',
+      'List the documents an applicant must submit for the visa described by the user.',
+      'Rules:',
+      '- Output ONLY the list. One document per line, exactly in this format: - <document name> | <instruction for the applicant, max 15 words>',
+      '- No headings, numbering, blank lines, notes or text before or after the list.',
+      '- 10 to 20 documents, most important first, specific to the destination country and visa type.',
+      `- Tailor financial and employment proof to a ${applicant.toLowerCase()}` +
+        (key.applicant_type === 'salaried'
+          ? ' (salary slips, Form 16, employer NOC / leave letter, personal ITR and bank statements).'
+          : ' (company registration, GST, business ITR, business and personal bank statements, letter on company letterhead).'),
+      '- When a document in the library means the same thing, use the library name EXACTLY as written.',
+      '- Keep document names short (max 8 words). Do not repeat documents.',
+    ].join('\n');
+    const user = [
+      `Destination country: ${key.country}`,
+      `Visa type: ${key.visa_type}`,
+      `Applicant: ${applicant}`,
+      'Applicant nationality: Indian (applying from India)',
+      `Document library: ${library.join('; ')}`,
+      existing.length ? `Already in the checklist (still include them if required): ${existing.join('; ')}` : '',
+    ].filter(Boolean).join('\n');
+    let stream;
+    try {
+      stream = await ctx.env.AI.run(AI_MODEL, {
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        stream: true, max_tokens: 1200, temperature: 0.2,
+      });
+    } catch (e) {
+      console.error('Workers AI error', e);
+      const msg = String(e && e.message || e);
+      throw new ApiError(502, /limit|quota|neuron|capacity/i.test(msg)
+        ? 'Free AI limit for today is used up. Try again tomorrow or add documents manually.'
+        : 'The AI service did not respond. Please try again.');
+    }
+    return new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-AI-Model': AI_MODEL },
+    });
+  },
+
   async listVisaTypes(ctx) {
     return { visa_types: await ctx.sb.select('visa_types', { select: 'id,name', order: 'id' }) };
   },
@@ -754,6 +805,7 @@ const ROUTES = [
   ['POST', /^\/api\/doc-types$/, 'addDocType', [A]],
   ['PUT', /^\/api\/doc-types\/(?<did>\d+)$/, 'renameDocType', [A]],
   ['DELETE', /^\/api\/doc-types\/(?<did>\d+)$/, 'deleteDocType', [A]],
+  ['POST', /^\/api\/ai\/checklist$/, 'aiChecklist', [A]],
   ['GET', /^\/api\/visa-types$/, 'listVisaTypes', [A]],
   ['POST', /^\/api\/visa-types$/, 'addVisaType', [A]],
   ['PUT', /^\/api\/visa-types\/(?<vid>\d+)$/, 'renameVisaType', [A]],
@@ -792,7 +844,7 @@ async function handleApi(request, env, url) {
   const cookies = [];
   let body;
   const ctx = {
-    request, query: url.searchParams, sb: supabase(env),
+    request, env, query: url.searchParams, sb: supabase(env),
     secure: env.COOKIE_SECURE === '1' ? '; Secure' : '',
     setCookie: c => cookies.push(c),
     cookie: name => {

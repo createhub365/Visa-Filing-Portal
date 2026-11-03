@@ -880,6 +880,12 @@ async function checklistBuilder(existing, prefill = {}, onSaved) {
         <div class="field"><label>3. Applicant *</label><select id="ba">${optionList([], '', 'Select applicant')}
           ${Object.entries(state.meta.applicant_types).map(([k, l]) => `<option value="${k}" ${k === cur.applicant_type ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></div>
       </div>
+      <div class="ai-bar"><button class="btn-ai" id="bai" disabled>✨ Generate checklist with AI</button>
+        <span class="small" id="bai-hint"></span></div>
+      <div class="ai-console" id="bcon" hidden>
+        <div class="ai-head"><span class="dot"></span><b>AI checklist generator</b><span class="small" id="bcon-model"></span>
+          <button class="btn-sm" id="bstop">Stop</button></div>
+        <div class="ai-log" id="blog"></div><div class="ai-raw" id="braw"></div></div>
       <div class="builder">
         <div><label>4. Pick documents</label><input id="bs" placeholder="Search document types…">
           <div class="pick" id="bpick"></div>
@@ -895,11 +901,14 @@ async function checklistBuilder(existing, prefill = {}, onSaved) {
         const list = docTypes.filter(d => d.name.toLowerCase().includes(q));
         $('#bpick').innerHTML = list.map(d => `<label><input type="checkbox" data-name="${esc(d.name)}" ${chosen.has(d.name) ? 'checked' : ''}> ${esc(d.name)}</label>`).join('')
           || '<div class="small muted" style="padding:8px">No match. Add it as a custom document below.</div>';
-        $('#bchosen').innerHTML = items.map((it, i) => `<div class="chosen-row"><span class="num">${i + 1}</span>
+        $('#bchosen').innerHTML = items.map((it, i) => `<div class="chosen-row${it.fresh ? ' fresh' : ''}"><span class="num">${i + 1}</span>
             <div style="flex:1;min-width:0"><div class="nm">${esc(it.name)}</div><input data-desc="${i}" value="${esc(it.description || '')}" placeholder="Instructions (optional)"></div>
             <button class="btn-sm" data-up="${i}" ${i ? '' : 'disabled'} title="Move up">↑</button><button class="btn-sm btn-red" data-rm="${i}" title="Remove">✕</button></div>`).join('')
           || '<div class="empty small">Tick documents on the left to add them here.</div>';
         $('#bn').textContent = items.length;
+        const fresh = el.querySelector('.chosen-row.fresh:last-child');
+        if (fresh) fresh.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        items.forEach(it => delete it.fresh);
         el.querySelectorAll('#bpick input').forEach(cb => cb.onchange = () => {
           if (cb.checked) items.push({ name: cb.dataset.name, description: '' });
           else items.splice(items.findIndex(i => i.name === cb.dataset.name), 1);
@@ -921,6 +930,123 @@ async function checklistBuilder(existing, prefill = {}, onSaved) {
       $('#baddc').onclick = addCustom;
       $('#bcustom').onkeydown = e => { if (e.key === 'Enter') addCustom(); };
       draw();
+
+      // ---- AI generation: streams suggestions and adds them to the checklist one by one
+      let busy = false, ctrl = null, t0 = 0, stats;
+      const sel = () => ({ country: $('#bc').value, visa_type: $('#bv').value, applicant_type: $('#ba').value });
+      const ready = () => { const k = sel(); return k.country && k.visa_type && k.applicant_type; };
+      const updAi = () => {
+        $('#bai').disabled = busy || !ready();
+        $('#bsave').disabled = busy;
+        $('#bai-hint').innerHTML = busy ? 'Generating… documents appear on the right as the AI writes them'
+          : ready() ? `Suggests documents for <b>${esc(checklistLabel(sel()))}</b>. Free · runs on Cloudflare Workers AI`
+            : 'Select country, visa type and applicant first';
+      };
+      ['#bc', '#bv', '#ba'].forEach(s => $(s).addEventListener('change', updAi));
+      updAi();
+      const secs = () => ((performance.now() - t0) / 1000).toFixed(1);
+      const log = (msg, cls = '') => {
+        const line = document.createElement('div');
+        line.className = 'l ' + cls;
+        line.innerHTML = `<span class="t">${secs().padStart(5)}s</span> ${msg}`;
+        $('#blog').appendChild(line);
+        $('#blog').scrollTop = $('#blog').scrollHeight;
+      };
+      const norm = s => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const addSuggested = async (name, description) => {
+        const lib = docTypes.find(d => norm(d.name) === norm(name));
+        let finalName = lib ? lib.name : name;
+        if (items.some(i => norm(i.name) === norm(finalName))) {
+          stats.present++; log(`= Already in checklist: <b>${esc(finalName)}</b>`, 'dim'); return;
+        }
+        if (lib) {
+          log(`✓ Matched document library: <b>${esc(finalName)}</b>`, 'ok');
+        } else {
+          const d = await api('POST', '/api/doc-types', { name });
+          if (!docTypes.some(x => x.id === d.id)) { docTypes.push(d); docTypes.sort((a, b) => a.name.localeCompare(b.name)); }
+          finalName = d.name; stats.newTypes++;
+          log(`＋ New document type created: <b>${esc(d.name)}</b>`, 'new');
+        }
+        items.push({ name: finalName, description, fresh: true });
+        stats.added++;
+        draw();
+      };
+      // "- Name | instruction" (tolerates numbering, bullets and **bold**)
+      const parseLine = line => {
+        const m = line.replace(/\*\*/g, '').match(/^\s*(?:[-*•]|\d+[.)])\s*(.+)$/);
+        if (!m) return null;
+        const [rawName, ...rest] = m[1].split('|');
+        const name = rawName.replace(/^["'`\s]+|["'`.:\s]+$/g, '').trim();
+        return name && name.length <= 120 ? { name, description: rest.join('|').trim().slice(0, 300) } : null;
+      };
+      $('#bstop').onclick = () => ctrl && ctrl.abort();
+      $('#bai').onclick = async () => {
+        const k = sel();
+        busy = true; updAi(); ctrl = new AbortController(); t0 = performance.now();
+        stats = { suggested: 0, added: 0, present: 0, newTypes: 0 };
+        $('#bcon').hidden = false; $('#bcon').classList.add('busy'); $('#bstop').hidden = false;
+        $('#blog').innerHTML = ''; $('#braw').textContent = ''; $('#braw').classList.add('live');
+        log('▶ Starting AI checklist generation');
+        log(`• Target: <b>${esc(checklistLabel(k))}</b> · applicant from India`);
+        log(`• Document library: ${docTypes.length} types · already in this checklist: ${items.length}`);
+        log('• Sending request to Cloudflare Workers AI…');
+        let chain = Promise.resolve();
+        try {
+          const res = await fetch('/api/ai/checklist', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: ctrl.signal,
+            body: JSON.stringify({ ...k, existing: items.map(i => i.name) }),
+          });
+          if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `AI request failed (${res.status})`);
+          const model = res.headers.get('X-AI-Model') || '';
+          $('#bcon-model').textContent = model;
+          log(`• Connected · model <b>${esc(model)}</b> · streaming response`);
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          let sse = '', lineBuf = '', first = true;
+          const take = line => {
+            const s = parseLine(line);
+            if (!s) return;
+            stats.suggested++;
+            chain = chain.then(() => addSuggested(s.name, s.description)).catch(e => log(`✕ ${esc(e.message)}`, 'err'));
+          };
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            sse += dec.decode(value, { stream: true });
+            let nl;
+            while ((nl = sse.indexOf('\n')) >= 0) {
+              const ev = sse.slice(0, nl).trim(); sse = sse.slice(nl + 1);
+              if (!ev.startsWith('data:')) continue;
+              const data = ev.slice(5).trim();
+              if (data === '[DONE]') continue;
+              let tok = '';
+              try { const j = JSON.parse(data); tok = j.response ?? j.choices?.[0]?.delta?.content ?? ''; } catch { continue; }
+              if (!tok) continue;
+              if (first) { log(`• First words from the AI after ${secs()}s`); first = false; }
+              $('#braw').textContent += tok;
+              $('#braw').scrollTop = $('#braw').scrollHeight;
+              lineBuf += tok;
+              let ln;
+              while ((ln = lineBuf.indexOf('\n')) >= 0) { take(lineBuf.slice(0, ln)); lineBuf = lineBuf.slice(ln + 1); }
+            }
+          }
+          take(lineBuf);
+          await chain;
+          if (stats.suggested) {
+            log(`✓ Done in ${secs()}s · ${stats.suggested} suggested · ${stats.added} added · ${stats.present} already present · ${stats.newTypes} new document types`, 'ok');
+          } else {
+            log('✕ The AI reply had no usable documents. Please try again.', 'err');
+          }
+          log('⚠ AI can be wrong or out of date. Review the list (and confirm with the embassy / VFS) before saving.', 'warn');
+        } catch (e) {
+          await chain;
+          log(e.name === 'AbortError' ? `■ Stopped · ${stats.added} documents were added before stopping` : `✕ ${esc(e.message)}`, e.name === 'AbortError' ? 'warn' : 'err');
+        } finally {
+          busy = false; ctrl = null; updAi();
+          $('#bcon').classList.remove('busy'); $('#braw').classList.remove('live'); $('#bstop').hidden = true;
+        }
+      };
+
       $('#bsave').onclick = async () => {
         const body = { country: $('#bc').value, visa_type: $('#bv').value, applicant_type: $('#ba').value, items };
         const r = await run(() => existing ? api('PUT', `/api/checklists/${existing.id}`, body) : api('POST', '/api/checklists', body));
