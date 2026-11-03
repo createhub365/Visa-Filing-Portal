@@ -1,53 +1,35 @@
 # Visa Filing Portal
 
-Login-based web app for visa filing: admin panel, staff, and customer portal with document checklist,
-upload, admin review (accept / reject with reasons) and approval-based document removal.
+Login-based web app for visa filing: admin panel, staff, and customer portal with per-country document
+checklists, upload, admin review (accept / reject with reasons) and approval-based document removal.
 
-- **Production:** Cloudflare Worker ([worker/index.js](worker/index.js)) serving `static/` + the `/api` backend.
-- **Local:** Python 3.9+ server ([app.py](app.py)), standard library only. Same API, same database.
+Live: https://visa-filing-portal.createhub365.workers.dev
+
+- **Hosting:** Cloudflare Worker ([worker/index.js](worker/index.js)) serves `static/` + the `/api` backend.
 - **Database:** Supabase PostgreSQL. **Documents:** Supabase Storage (private bucket `documents`).
-
-When you change backend behaviour, change it in **both** `worker/index.js` and `app.py`.
-
-## Deploy to Cloudflare (Workers Builds from GitHub)
-
-1. Cloudflare dashboard → **Workers & Pages** → **Create** → **Import a repository** → pick this GitHub repo.
-2. Project name: `visa-filing-portal` (must match `name` in [wrangler.jsonc](wrangler.jsonc)).
-   Build command: *(empty)* · Deploy command: `npx wrangler deploy` · Root directory: `/`.
-3. After the first deploy: Worker → **Settings → Variables and Secrets** → **Add** → type **Secret**,
-   name `SUPABASE_SECRET_KEY`, value = Supabase secret key → **Deploy**.
-4. Every push to `main` redeploys automatically.
-
-`SUPABASE_URL`, `SUPABASE_BUCKET` and `COOKIE_SECURE` are plain vars in `wrangler.jsonc`.
-
-Passwords use PBKDF2-SHA256 with 100,000 iterations (the Workers limit). Accounts created before this format
-(`salt$hash`) can't log in on Cloudflare until the admin resets their password, or they log in once on the local app.
-
-## Setup (once per Supabase project)
-
-1. Supabase dashboard → your project → **SQL Editor** → paste and run [supabase/schema.sql](supabase/schema.sql).
-   It creates the tables, locks them down (RLS on, no public access) and creates the private `documents` bucket.
-2. Copy `.env.example` to `.env` and fill in:
-   - `SUPABASE_URL`: Project Settings → Data API → Project URL
-   - `SUPABASE_SECRET_KEY`: Project Settings → API Keys → Secret key (`sb_secret_...`) or legacy `service_role` key
-
-   **Never share `.env` or put the secret key in frontend code.** It bypasses all security rules.
-
-## Run
-
-```
-python app.py
-```
-
-Open http://localhost:8000. On first start the app creates `admin` / `admin123`. Change it via *Change password*.
+- No build step, no npm packages.
 
 ## Roles
 
 | Role | Can do |
 |---|---|
-| **Admin** | Create staff/customers (ID + password), set profile (name, passport no., visa type, country, stage), manage checklist (templates or custom items), review documents (accept / reject with preset + custom reasons), approve/deny removal requests, remove directly, disable accounts, reset passwords |
-| **Staff** | Own dashboard (counts + customers needing re-upload), create customers (not staff), see all customers, upload documents for them, request removal |
-| **Customer** | See own profile, stage tracker and checklist; upload / re-upload; request removal |
+| **Admin** | Everything: staff and customers, **Checklists** (make per country + visa type + salaried/business), document types, review documents (accept / reject with reasons), approve/deny removal requests, edit profiles, reset passwords |
+| **Staff** | Dashboard, create customers (not staff), upload documents for customers, request removal, **request a checklist** from the admin |
+| **Customer** | Own profile, stage tracker and checklist; upload / re-upload; request removal |
+
+## Checklists
+
+- Admin → **Checklists** → **Make checklist**: country → visa type → applicant (**Salaried person** or
+  **Businessman / Self-employed**) → tick documents from the document-type list, or add a custom document
+  (custom ones are saved to the list for next time).
+- Creating a customer asks for the same three things. If a matching checklist exists, its documents are added
+  automatically.
+- If none exists, the customer is still created and shows **No checklist created**. Staff (or the customer)
+  press **Request admin to create checklist**; it appears under Admin → Checklists → *Checklist requests*.
+  When the admin saves that checklist, it is applied to **every waiting customer** with the same
+  country + visa type + applicant type.
+- Editing a checklist later does not change customers who already have documents; admin can press
+  **Apply checklist** on a customer to add any missing documents.
 
 ## Document flow
 
@@ -57,26 +39,39 @@ Open http://localhost:8000. On first start the app creates `admin` / `admin123`.
 **Remove** by customer/staff is never instant: it creates a request, and the document stays (and can't be replaced)
 until the admin approves it. On approval the file is deleted from storage and the item goes back to `Pending`.
 
-## Where data lives (Supabase)
+## Setup (new Supabase project)
+
+In the Supabase **SQL Editor**, run in order:
+1. [supabase/schema.sql](supabase/schema.sql): tables, security (RLS on, no public access), `documents` bucket
+2. [supabase/002_checklists.sql](supabase/002_checklists.sql): checklist builder tables + starter document types
+
+The first login as `admin` / `admin123` on an empty database creates the admin account. Change the password right away.
+
+## Deploy (Cloudflare Workers Builds from GitHub)
+
+1. Cloudflare dashboard → **Workers & Pages** → **Create** → **Import a repository** → this repo.
+2. Project name `visa-filing-portal` (matches `name` in [wrangler.jsonc](wrangler.jsonc)); build command empty;
+   deploy command `npx wrangler deploy`.
+3. Worker → **Settings → Variables and Secrets** → add **Secret** `SUPABASE_SECRET_KEY` (Supabase secret key) → Deploy.
+4. Every push to `main` redeploys automatically.
+
+`SUPABASE_URL`, `SUPABASE_BUCKET` and `COOKIE_SECURE` are plain vars in `wrangler.jsonc`.
+**Never commit the secret key.** It bypasses all database security.
+
+## Data (Supabase)
 
 | Table | Holds |
 |---|---|
-| `users` | admin, staff, customers (passwords hashed with PBKDF2) + customer profile |
-| `sessions` | login sessions |
-| `checklist_items` | each required document, its status, file path, reject reasons |
+| `users` | admin, staff, customers (PBKDF2-SHA256, 100k iterations) + profile incl. country, visa type, applicant type |
+| `sessions` | login sessions (7 days) |
+| `checklist_templates` | admin-made checklists: country + visa type + applicant type → documents |
+| `doc_types` | document names to pick from in the builder |
+| `checklist_requests` | "please create a checklist" requests to admin |
+| `checklist_items` | each customer's required documents, status, file path, reject reasons |
 | `removal_requests` | removal requests and admin decisions |
 | `activity` | audit log per customer |
 | Storage `documents` | uploaded files, path `<customer_id>/<item_id>_<random>.<ext>` |
 
-Backups: Supabase takes daily database backups on paid plans. On the free plan, download a backup from
-Database → Backups, or export tables regularly.
-
 ## Customising
 
-In `app.py`: `REJECT_REASONS`, `STAGES`, `CHECKLIST_TEMPLATES` (lists at the top of the file).
-
-## Going live
-
-- Run behind HTTPS (e.g. Nginx/Caddy reverse proxy) and set `COOKIE_SECURE=1` in `.env`.
-- Change the admin password immediately.
-- For users in India, a Supabase project in **Mumbai (ap-south-1)** is faster. Run the same `schema.sql` there and change `.env`.
+In `worker/index.js`: `REJECT_REASONS`, `STAGES`, `VISA_TYPES`, `APPLICANT_TYPES`. Countries: `COUNTRIES` in `static/app.js`.

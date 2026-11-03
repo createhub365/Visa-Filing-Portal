@@ -32,28 +32,12 @@ const STAGES = [
   'Visa Rejected',
 ];
 
-const CHECKLIST_TEMPLATES = {
-  'Tourist Visa': [
-    'Passport (first & last page)', 'Passport size photograph', 'Aadhaar / National ID',
-    'Bank statement (last 6 months)', 'Income tax return (last 2 years)',
-    'Flight booking', 'Hotel booking', 'Travel insurance', 'Cover letter',
-  ],
-  'Student Visa': [
-    'Passport (first & last page)', 'Passport size photograph', 'Offer / admission letter',
-    'Academic certificates & marksheets', 'IELTS / TOEFL score card', 'Statement of purpose',
-    'Proof of funds / bank statement', 'Education loan sanction letter', 'Medical certificate',
-  ],
-  'Work Visa': [
-    'Passport (first & last page)', 'Passport size photograph', 'Job offer letter',
-    'Employment contract', 'Educational certificates', 'Experience letters',
-    'Updated resume / CV', 'Police clearance certificate', 'Medical certificate',
-  ],
-  'Business Visa': [
-    'Passport (first & last page)', 'Passport size photograph', 'Invitation letter',
-    'Company cover letter', 'Company registration proof', 'Bank statement (last 6 months)',
-    'Income tax return (last 2 years)', 'Flight booking',
-  ],
-};
+const VISA_TYPES = [
+  'Tourist Visa', 'Visitor / Family Visit Visa', 'Business Visa', 'Student Visa', 'Work Visa',
+  'Dependent / Spouse Visa', 'Transit Visa', 'PR / Immigration',
+];
+
+const APPLICANT_TYPES = { salaried: 'Salaried person', business: 'Businessman / Self-employed' };
 
 // ------------------------------------------------------------------ errors --
 
@@ -91,7 +75,9 @@ function supabase(env) {
       data = JSON.stringify(body);
       if (!h['Content-Type']) h['Content-Type'] = 'application/json';
     }
-    const url = base + path + (query ? '?' + new URLSearchParams(query) : '');
+    // %20 for spaces (not "+"), so filters like country=eq.United States match exactly
+    const qs = query ? Object.entries(query).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&') : '';
+    const url = base + path + (qs ? '?' + qs : '');
     const res = await fetch(url, { method, headers: h, body: data });
     if (!res.ok) {
       const text = await res.text();
@@ -156,10 +142,17 @@ async function checkPassword(password, stored) {
 // --------------------------------------------------------------- serializers --
 
 const USER_FIELDS = ['id', 'username', 'role', 'full_name', 'email', 'phone', 'passport_no', 'nationality',
-  'dob', 'visa_type', 'country', 'stage', 'notes', 'active', 'created_at'];
+  'dob', 'visa_type', 'country', 'applicant_type', 'stage', 'notes', 'active', 'created_at'];
 const USER_SELECT = USER_FIELDS.join(',');
 const PROFILE_FIELDS = ['full_name', 'email', 'phone', 'passport_no', 'nationality', 'dob',
-  'visa_type', 'country', 'stage', 'notes'];
+  'visa_type', 'country', 'applicant_type', 'stage', 'notes'];
+
+function profileValues(b) {
+  const values = {};
+  for (const k of PROFILE_FIELDS) if (k in b) values[k] = str(b[k]);
+  must(!values.applicant_type || values.applicant_type in APPLICANT_TYPES, 400, 'Applicant type must be salaried or business');
+  return values;
+}
 const ITEM_SELECT = '*,uploader:users!checklist_items_uploaded_by_fkey(full_name,role),' +
   'removal_requests(id,reason,created_at,status,requester:users!removal_requests_requested_by_fkey(full_name,role))';
 
@@ -208,6 +201,66 @@ async function log(sb, customerId, userId, action, detail = '') {
   await sb.insert('activity', { customer_id: customerId, user_id: userId, action, detail });
 }
 
+const checklistLabel = c => `${c.country} · ${c.visa_type} · ${APPLICANT_TYPES[c.applicant_type] || c.applicant_type}`;
+
+async function findTemplate(sb, c) {
+  if (!c.country || !c.visa_type || !c.applicant_type) return null;
+  return sb.one('checklist_templates', { country: eq(c.country), visa_type: eq(c.visa_type), applicant_type: eq(c.applicant_type) });
+}
+
+// Add the template's documents the customer doesn't have yet; close their pending checklist request.
+async function applyTemplate(sb, customerId, template, userId) {
+  const have = new Set((await sb.select('checklist_items', { select: 'name', customer_id: eq(customerId) })).map(r => r.name));
+  const add = template.items.filter(it => !have.has(it.name));
+  if (add.length) {
+    await sb.insert('checklist_items', add.map(it => ({ customer_id: customerId, name: it.name, description: it.description || '' })));
+  }
+  await sb.update('checklist_requests', { status: 'done', resolved_at: now() }, { customer_id: eq(customerId), status: eq('pending') });
+  await log(sb, customerId, userId, 'Checklist applied', `${checklistLabel(template)} — ${add.length} documents added`);
+  return add.length;
+}
+
+function cleanItems(items) {
+  must(Array.isArray(items) && items.length, 400, 'Add at least one document to the checklist');
+  must(items.length <= 100, 400, 'A checklist can have at most 100 documents');
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const name = str(it && it.name);
+    if (!name || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    out.push({ name: name.slice(0, 200), description: str(it.description).slice(0, 500) });
+  }
+  must(out.length, 400, 'Add at least one document to the checklist');
+  return out;
+}
+
+function checklistKey(b) {
+  const key = { country: str(b.country), visa_type: str(b.visa_type), applicant_type: str(b.applicant_type) };
+  must(key.country, 400, 'Select a country');
+  must(key.visa_type, 400, 'Select a visa type');
+  must(key.applicant_type in APPLICANT_TYPES, 400, 'Select salaried person or businessman');
+  return key;
+}
+
+// After a checklist is saved: give it to matching customers who still have no documents.
+async function applyToWaitingCustomers(sb, template, userId) {
+  const customers = await sb.select('users', {
+    select: 'id', role: eq('customer'), country: eq(template.country),
+    visa_type: eq(template.visa_type), applicant_type: eq(template.applicant_type),
+  });
+  if (!customers.length) return 0;
+  const ids = customers.map(c => c.id);
+  const withItems = new Set((await sb.select('checklist_items', { select: 'customer_id', customer_id: `in.(${ids.join(',')})` })).map(r => r.customer_id));
+  let applied = 0;
+  for (const id of ids) {
+    if (withItems.has(id)) continue;
+    await applyTemplate(sb, id, template, userId);
+    applied++;
+  }
+  return applied;
+}
+
 const handlers = {
   async login(ctx) {
     const { sb } = ctx;
@@ -236,7 +289,7 @@ const handlers = {
   },
 
   async me(ctx, user) {
-    return { user: userJson(user), reject_reasons: REJECT_REASONS, stages: STAGES, templates: CHECKLIST_TEMPLATES };
+    return { user: userJson(user), reject_reasons: REJECT_REASONS, stages: STAGES, visa_types: VISA_TYPES, applicant_types: APPLICANT_TYPES };
   },
 
   async changePassword(ctx, user) {
@@ -283,16 +336,22 @@ const handlers = {
     must((b.password || '').length >= 6, 400, 'Password must be at least 6 characters');
     must(str(b.full_name), 400, 'Full name is required');
     must(!(await sb.one('users', { select: 'id', username: eq(username) })), 400, 'Username already exists');
-    const row = Object.fromEntries(PROFILE_FIELDS.map(k => [k, str(b[k])]));
+    const row = profileValues(b);
     row.stage = row.stage || STAGES[0];
+    if (role === 'customer') {
+      must(row.country, 400, 'Select the destination country');
+      must(row.visa_type, 400, 'Select the visa type');
+      must(row.applicant_type, 400, 'Select salaried person or businessman');
+    }
     Object.assign(row, { username, pw: await hashPassword(b.password), role });
     const uid = (await sb.insert('users', row))[0].id;
+    let checklist = 0;
     if (role === 'customer') {
-      const names = [...(CHECKLIST_TEMPLATES[b.template] || []), ...(b.extra_items || []).map(str).filter(Boolean)];
-      if (names.length) await sb.insert('checklist_items', names.map(name => ({ customer_id: uid, name })));
-      await log(sb, uid, user.id, 'Customer created', `${names.length} checklist items`);
+      await log(sb, uid, user.id, 'Customer created');
+      const template = await findTemplate(sb, row);
+      if (template) checklist = await applyTemplate(sb, uid, template, user.id);
     }
-    return { id: uid };
+    return { id: uid, checklist };
   },
 
   async updateUser(ctx, user, { uid }) {
@@ -300,8 +359,7 @@ const handlers = {
     const target = await sb.one('users', { id: eq(uid) });
     must(target, 404, 'User not found');
     const b = await ctx.json();
-    const values = {};
-    for (const k of PROFILE_FIELDS) if (k in b) values[k] = str(b[k]);
+    const values = profileValues(b);
     if ('active' in b && target.role !== 'admin') {
       values.active = !!b.active;
       if (!b.active) await sb.delete('sessions', { user_id: eq(uid) });
@@ -326,7 +384,15 @@ const handlers = {
     const row = await sb.one('users', { select: USER_SELECT, id: eq(uid), role: eq('customer') });
     must(row, 404, 'Customer not found');
     const items = (await sb.select('checklist_items', { select: ITEM_SELECT, customer_id: eq(uid), order: 'id' })).map(itemJson);
-    const out = { customer: userJson(row), items, progress: progressOf(items) };
+    const req = await sb.one('checklist_requests', {
+      select: 'created_at,requester:users!checklist_requests_requested_by_fkey(full_name,role)',
+      customer_id: eq(uid), status: eq('pending'),
+    });
+    const out = {
+      customer: userJson(row), items, progress: progressOf(items),
+      checklist_available: !!(await findTemplate(sb, row)),
+      checklist_request: req ? { created_at: req.created_at, by_name: req.requester?.full_name ?? null, by_role: req.requester?.role ?? null } : null,
+    };
     if (user.role === 'admin' || user.role === 'staff') {
       const rows = await sb.select('activity', {
         select: 'action,detail,at,actor:users!activity_user_id_fkey(full_name,role)',
@@ -341,11 +407,109 @@ const handlers = {
     const { sb } = ctx;
     must(await sb.one('users', { select: 'id', id: eq(uid), role: eq('customer') }), 404, 'Customer not found');
     const b = await ctx.json();
-    const names = (b.name ? [b.name] : [...(CHECKLIST_TEMPLATES[b.template] || [])]).map(str).filter(Boolean);
-    must(names.length, 400, 'Document name is required');
-    const description = str(b.description);
-    await sb.insert('checklist_items', names.map(name => ({ customer_id: uid, name, description })));
-    await log(sb, uid, user.id, 'Checklist updated', 'Added: ' + names.join(', '));
+    const name = str(b.name);
+    must(name, 400, 'Document name is required');
+    await sb.insert('checklist_items', { customer_id: uid, name, description: str(b.description) });
+    await log(sb, uid, user.id, 'Checklist updated', 'Added: ' + name);
+    return { ok: true };
+  },
+
+  async applyChecklist(ctx, user, { uid }) {
+    const { sb } = ctx;
+    const row = await sb.one('users', { select: USER_SELECT, id: eq(uid), role: eq('customer') });
+    must(row, 404, 'Customer not found');
+    const template = await findTemplate(sb, row);
+    must(template, 404, 'No checklist exists for this country, visa type and applicant type yet');
+    return { added: await applyTemplate(sb, uid, template, user.id) };
+  },
+
+  async requestChecklist(ctx, user, { uid }) {
+    const { sb } = ctx;
+    must(canAccessCustomer(user, uid), 403, 'Not allowed');
+    const row = await sb.one('users', { select: USER_SELECT, id: eq(uid), role: eq('customer') });
+    must(row, 404, 'Customer not found');
+    must(row.country && row.visa_type && row.applicant_type, 400,
+      'Country, visa type and salaried/business must be set on the profile first');
+    must(!(await sb.one('checklist_items', { select: 'id', customer_id: eq(uid) })), 400, 'This customer already has a checklist');
+    try {
+      await sb.insert('checklist_requests', { customer_id: uid, requested_by: user.id });
+    } catch (e) {
+      if (e instanceof SupabaseError && e.code === '23505') throw new ApiError(400, 'Checklist already requested from admin');
+      throw e;
+    }
+    await log(sb, uid, user.id, 'Checklist requested from admin', checklistLabel(row));
+    return { ok: true };
+  },
+
+  async listChecklistRequests(ctx) {
+    const rows = await ctx.sb.select('checklist_requests', {
+      select: 'id,created_at,customer:users!checklist_requests_customer_id_fkey(id,full_name,country,visa_type,applicant_type),' +
+        'requester:users!checklist_requests_requested_by_fkey(full_name,role)',
+      status: eq('pending'), order: 'id',
+    });
+    return {
+      requests: rows.map(r => ({
+        id: r.id, created_at: r.created_at, customer_id: r.customer.id, customer_name: r.customer.full_name,
+        country: r.customer.country, visa_type: r.customer.visa_type, applicant_type: r.customer.applicant_type,
+        by_name: r.requester?.full_name ?? null, by_role: r.requester?.role ?? null,
+      })),
+    };
+  },
+
+  async listChecklists(ctx) {
+    return { checklists: await ctx.sb.select('checklist_templates', { select: 'id,country,visa_type,applicant_type,items,updated_at', order: 'country,visa_type,applicant_type' }) };
+  },
+
+  async createChecklist(ctx, user) {
+    const { sb } = ctx;
+    const b = await ctx.json();
+    const key = checklistKey(b);
+    const items = cleanItems(b.items);
+    let template;
+    try {
+      template = (await sb.insert('checklist_templates', { ...key, items, created_by: user.id }))[0];
+    } catch (e) {
+      if (e instanceof SupabaseError && e.code === '23505') throw new ApiError(400, `A checklist for ${checklistLabel(key)} already exists. Edit it instead.`);
+      throw e;
+    }
+    return { id: template.id, applied_to: await applyToWaitingCustomers(sb, template, user.id) };
+  },
+
+  async updateChecklist(ctx, user, { cid }) {
+    const { sb } = ctx;
+    const b = await ctx.json();
+    const key = checklistKey(b);
+    const items = cleanItems(b.items);
+    let rows;
+    try {
+      rows = await sb.update('checklist_templates', { ...key, items, updated_at: now() }, { id: eq(cid) });
+    } catch (e) {
+      if (e instanceof SupabaseError && e.code === '23505') throw new ApiError(400, `A checklist for ${checklistLabel(key)} already exists.`);
+      throw e;
+    }
+    must(rows.length, 404, 'Checklist not found');
+    return { id: cid, applied_to: await applyToWaitingCustomers(sb, rows[0], user.id) };
+  },
+
+  async deleteChecklist(ctx, user, { cid }) {
+    await ctx.sb.delete('checklist_templates', { id: eq(cid) });
+    return { ok: true };
+  },
+
+  async listDocTypes(ctx) {
+    return { doc_types: await ctx.sb.select('doc_types', { select: 'id,name', order: 'name' }) };
+  },
+
+  async addDocType(ctx) {
+    const name = str((await ctx.json()).name).slice(0, 200);
+    must(name, 400, 'Document name is required');
+    const existing = await ctx.sb.one('doc_types', { select: 'id,name', name: eq(name) });
+    if (existing) return existing;
+    return (await ctx.sb.insert('doc_types', { name }))[0];
+  },
+
+  async deleteDocType(ctx, user, { did }) {
+    await ctx.sb.delete('doc_types', { id: eq(did) });
     return { ok: true };
   },
 
@@ -522,6 +686,16 @@ const ROUTES = [
   ['PUT', /^\/api\/users\/(?<uid>\d+)$/, 'updateUser', [A]],
   ['GET', /^\/api\/customers\/(?<uid>\d+)$/, 'customer', ALL],
   ['POST', /^\/api\/customers\/(?<uid>\d+)\/items$/, 'addItem', [A]],
+  ['POST', /^\/api\/customers\/(?<uid>\d+)\/apply-checklist$/, 'applyChecklist', [A]],
+  ['POST', /^\/api\/customers\/(?<uid>\d+)\/checklist-request$/, 'requestChecklist', ALL],
+  ['GET', /^\/api\/checklist-requests$/, 'listChecklistRequests', [A]],
+  ['GET', /^\/api\/checklists$/, 'listChecklists', [A, S]],
+  ['POST', /^\/api\/checklists$/, 'createChecklist', [A]],
+  ['PUT', /^\/api\/checklists\/(?<cid>\d+)$/, 'updateChecklist', [A]],
+  ['DELETE', /^\/api\/checklists\/(?<cid>\d+)$/, 'deleteChecklist', [A]],
+  ['GET', /^\/api\/doc-types$/, 'listDocTypes', [A]],
+  ['POST', /^\/api\/doc-types$/, 'addDocType', [A]],
+  ['DELETE', /^\/api\/doc-types\/(?<did>\d+)$/, 'deleteDocType', [A]],
   ['DELETE', /^\/api\/items\/(?<iid>\d+)$/, 'deleteItem', [A]],
   ['POST', /^\/api\/items\/(?<iid>\d+)\/upload$/, 'upload', ALL],
   ['GET', /^\/api\/items\/(?<iid>\d+)\/file$/, 'file', ALL],
