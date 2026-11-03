@@ -33,6 +33,11 @@ const STAGES = [
 ];
 
 const AI_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+// vision models for reading passports / ID documents (second one is a fallback)
+const OCR_MODELS = ['@cf/meta/llama-4-scout-17b-16e-instruct', '@cf/mistralai/mistral-small-3.1-24b-instruct'];
+const OCR_FIELDS = ['document_type', 'surname', 'given_names', 'full_name', 'passport_no', 'nationality', 'sex', 'dob',
+  'place_of_birth', 'date_of_issue', 'date_of_expiry', 'address', 'mrz_line1', 'mrz_line2'];
+const MAX_OCR_IMAGE = 4 * 1024 * 1024; // base64 characters
 
 const APPLICANT_TYPES = { salaried: 'Salaried person', business: 'Businessman / Self-employed' };
 
@@ -138,10 +143,10 @@ async function checkPassword(password, stored) {
 
 // --------------------------------------------------------------- serializers --
 
-const USER_FIELDS = ['id', 'username', 'role', 'full_name', 'email', 'phone', 'passport_no', 'nationality',
-  'dob', 'visa_type', 'country', 'applicant_type', 'stage', 'notes', 'active', 'created_at'];
+const USER_FIELDS = ['id', 'username', 'role', 'full_name', 'email', 'phone', 'passport_no', 'passport_expiry', 'nationality',
+  'dob', 'address', 'visa_type', 'country', 'applicant_type', 'stage', 'notes', 'active', 'created_at'];
 const USER_SELECT = USER_FIELDS.join(',');
-const PROFILE_FIELDS = ['full_name', 'email', 'phone', 'passport_no', 'nationality', 'dob',
+const PROFILE_FIELDS = ['full_name', 'email', 'phone', 'passport_no', 'passport_expiry', 'nationality', 'dob', 'address',
   'visa_type', 'country', 'applicant_type', 'stage', 'notes'];
 
 function profileValues(b) {
@@ -578,6 +583,50 @@ const handlers = {
     });
   },
 
+  // Reads one document photo (passport page, ID card) and returns the text fields it can see.
+  // The image is only sent to Workers AI for reading; it is not stored.
+  async aiExtract(ctx) {
+    must(ctx.env.AI, 500, 'Workers AI is not enabled for this Worker');
+    const image = str((await ctx.json()).image);
+    must(/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image), 400, 'Send a JPG, PNG or WEBP image');
+    must(image.length <= MAX_OCR_IMAGE, 413, 'Image is too large. Use a smaller photo.');
+    const prompt = [
+      'You are an OCR engine for identity documents (passport data page, passport address page, national ID).',
+      'Read the image and return ONLY one JSON object, no markdown, with exactly these keys:',
+      OCR_FIELDS.join(', ') + '.',
+      'Rules: copy text exactly as printed; dates as YYYY-MM-DD; sex as M or F; nationality as printed (e.g. INDIAN);',
+      'address as one line; mrz_line1 and mrz_line2 are the two machine-readable lines at the bottom of a passport',
+      '(characters A-Z, 0-9 and <), copied character by character; full_name is given names followed by surname.',
+      'Use null for anything not visible. Never guess.',
+    ].join('\n');
+    let lastError;
+    for (const model of OCR_MODELS) {
+      try {
+        const out = await ctx.env.AI.run(model, {
+          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: image } }] }],
+          max_tokens: 700, temperature: 0,
+        });
+        const text = typeof out?.response === 'string' ? out.response : JSON.stringify(out?.response ?? out);
+        const m = text.match(/\{[\s\S]*\}/);
+        if (!m) { lastError = new Error('no JSON in reply'); continue; }
+        const raw = JSON.parse(m[0]);
+        const fields = {};
+        for (const k of OCR_FIELDS) {
+          const v = raw[k];
+          if (v != null && String(v).trim() && !/^(null|n\/a|none|unknown)$/i.test(String(v).trim())) fields[k] = String(v).trim().slice(0, 300);
+        }
+        return { model, fields };
+      } catch (e) {
+        lastError = e;
+        console.error(`OCR with ${model} failed`, e);
+      }
+    }
+    const msg = String(lastError && lastError.message || lastError);
+    throw new ApiError(502, /limit|quota|neuron|capacity/i.test(msg)
+      ? 'Free AI limit for today is used up. Fill the details manually or try tomorrow.'
+      : 'Could not read this image. Try a sharper, well-lit photo of the passport page.');
+  },
+
   async listVisaTypes(ctx) {
     return { visa_types: await ctx.sb.select('visa_types', { select: 'id,name', order: 'id' }) };
   },
@@ -806,6 +855,7 @@ const ROUTES = [
   ['PUT', /^\/api\/doc-types\/(?<did>\d+)$/, 'renameDocType', [A]],
   ['DELETE', /^\/api\/doc-types\/(?<did>\d+)$/, 'deleteDocType', [A]],
   ['POST', /^\/api\/ai\/checklist$/, 'aiChecklist', [A]],
+  ['POST', /^\/api\/ai\/extract$/, 'aiExtract', [A, S]],
   ['GET', /^\/api\/visa-types$/, 'listVisaTypes', [A]],
   ['POST', /^\/api\/visa-types$/, 'addVisaType', [A]],
   ['PUT', /^\/api\/visa-types\/(?<vid>\d+)$/, 'renameVisaType', [A]],

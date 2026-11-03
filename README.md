@@ -31,6 +31,16 @@ Live: https://visa-filing-portal.createhub365.workers.dev
 - Editing a checklist later does not change customers who already have documents; admin can press
   **Apply checklist** on a customer to add any missing documents.
 
+## AI features (Cloudflare Workers AI, free daily allocation)
+
+- **Generate checklist with AI** (Checklists → Make checklist): Llama 3.3 70B suggests documents for the chosen
+  country + visa type + applicant, streamed live; each one is matched to the document library (or added to it)
+  and dropped into the checklist. Always review before saving.
+- **Auto-fetch customer from documents** (+ New customer → Auto-fetch): upload or photograph the passport pages;
+  a vision model (Llama 4 Scout, fallback Mistral Small 3.1) reads name, passport no., DOB, expiry, nationality and
+  address. Passport no., DOB and expiry are marked **MRZ verified** only when the passport's MRZ check digits match.
+  The admin/staff reviews the fields, then the normal customer form opens pre-filled. Photos are not stored.
+
 ## Document flow
 
 `Pending` → upload → `In Review` → admin **Accept** → `Accepted`

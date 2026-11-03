@@ -349,7 +349,7 @@ async function renderDashboard() {
     <div class="stats">${cards.join('')}</div>
     <div class="card"><div class="page-head" style="margin-bottom:8px"><h2>Needs re-upload</h2><span class="small muted">Customers with rejected documents</span></div><div id="attn"><div class="empty">Loading…</div></div></div>
     <div class="card"><div class="page-head" style="margin-bottom:8px"><h2>Recent customers</h2><a href="#/customers">View all →</a></div><div id="recent"></div></div>`);
-  main.querySelector('#newc').onclick = () => userFormModal('customer');
+  main.querySelector('#newc').onclick = newCustomer;
   const { users } = await api('GET', '/api/users?role=customer');
   const attn = users.filter(u => u.progress.rejected > 0);
   main.querySelector('#attn').innerHTML = attn.length ? customerTable(attn) : '<div class="empty">No rejected documents right now.</div>';
@@ -379,7 +379,7 @@ async function renderUserList(role) {
       <div class="toolbar"><input id="q" placeholder="Search name, username, passport…">
       ${canCreate ? `<button class="btn-primary" id="new">+ New ${role}</button>` : ''}</div></div>
     <div class="card" id="list"><div class="empty">Loading…</div></div>`);
-  if (canCreate) main.querySelector('#new').onclick = () => userFormModal(role);
+  if (canCreate) main.querySelector('#new').onclick = () => (role === 'customer' ? newCustomer() : userFormModal(role));
   const { users } = await api('GET', `/api/users?role=${role}`);
   const draw = () => {
     const q = main.querySelector('#q').value.toLowerCase();
@@ -400,9 +400,11 @@ async function renderUserList(role) {
 }
 
 // ------------------------------------------------------- create/edit user --
-function userFormModal(role, user = null) {
+// prefill: values for a new user (e.g. from "Auto-fetch from documents")
+function userFormModal(role, user = null, prefill = {}) {
   const m = state.meta;
-  const v = k => esc(user?.[k] ?? '');
+  const src = user || prefill;
+  const v = k => esc(src[k] ?? '');
   const isCust = role === 'customer';
   const opts = (list, sel) => list.map(o => `<option ${o === sel ? 'selected' : ''}>${esc(o)}</option>`).join('');
   const body = `<form id="uf" class="grid2">
@@ -416,13 +418,15 @@ function userFormModal(role, user = null) {
     <div class="field"><label>Phone</label><input name="phone" value="${v('phone')}"></div>
     ${isCust ? `
       <div class="field"><label>Passport number</label><input name="passport_no" value="${v('passport_no')}" style="text-transform:uppercase"></div>
+      <div class="field"><label>Passport expiry</label><input name="passport_expiry" type="date" value="${v('passport_expiry')}"></div>
       <div class="field"><label>Date of birth</label><input name="dob" type="date" value="${v('dob')}"></div>
       <div class="field"><label>Nationality</label><input name="nationality" value="${v('nationality') || (user ? '' : 'Indian')}"></div>
+      <div class="field span2"><label>Address</label><textarea name="address" rows="2" style="min-height:0">${v('address')}</textarea></div>
       <div class="field"><label>Application stage</label><select name="stage">${opts(m.stages, user?.stage || m.stages[0])}</select></div>
       <div class="section-label">Visa &amp; checklist</div>
-      <div class="field"><label>Destination country *</label><select name="country" required>${countryOptions(user?.country)}</select></div>
-      <div class="field"><label>Visa type *</label><select name="visa_type" required>${visaOptions(user?.visa_type)}</select></div>
-      <div class="field span2"><label>Applicant *</label>${applicantRadios(user?.applicant_type)}</div>
+      <div class="field"><label>Destination country *</label><select name="country" required>${countryOptions(src.country)}</select></div>
+      <div class="field"><label>Visa type *</label><select name="visa_type" required>${visaOptions(src.visa_type)}</select></div>
+      <div class="field span2"><label>Applicant *</label>${applicantRadios(src.applicant_type)}</div>
       <div class="field span2" id="clhint"></div>
       <div class="field span2"><label>Notes for customer</label><textarea name="notes" placeholder="Visible to the customer on their portal">${v('notes')}</textarea></div>
     ` : ''}
@@ -472,6 +476,243 @@ function userFormModal(role, user = null) {
     },
   });
 }
+// ------------------------------------------- new customer: manual or auto
+function newCustomer() {
+  modal({
+    title: 'New customer',
+    body: `<p class="muted" style="margin-top:0">How do you want to add the customer?</p>
+      <div class="mode-choice">
+        <button data-mode="auto"><span class="ic">⚡</span><b>Auto-fetch from documents</b>
+          <span>Upload or click a photo of the passport. AI reads name, passport no., DOB, address… and fills the form.</span></button>
+        <button data-mode="manual"><span class="ic">✍️</span><b>Manual entry</b><span>Type all the details yourself.</span></button>
+      </div>`,
+    onMount: (el, close) => el.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => {
+      close();
+      if (b.dataset.mode === 'auto') autoFetchCustomer(); else userFormModal('customer');
+    }),
+  });
+}
+
+// Shrink photos before upload (faster, and well within the AI's limits)
+async function imageToDataURL(file, max = 1600) {
+  const bmp = await createImageBitmap(file);
+  const s = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * s); c.height = Math.round(bmp.height * s);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.85);
+}
+
+// Full-screen camera; resolves with a JPEG blob, or null if cancelled
+function openCamera() {
+  return new Promise(async resolve => {
+    if (!navigator.mediaDevices?.getUserMedia) { // older phones: the system camera through a file input
+      const inp = document.createElement('input');
+      inp.type = 'file'; inp.accept = 'image/*'; inp.capture = 'environment';
+      inp.onchange = () => resolve(inp.files[0] || null);
+      inp.click();
+      return;
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+    } catch (e) {
+      toast(e.name === 'NotAllowedError' ? 'Camera permission denied. Allow camera access in the browser.' : 'Camera not available on this device', true);
+      return resolve(null);
+    }
+    const ov = document.createElement('div');
+    ov.className = 'cam';
+    ov.innerHTML = `<video autoplay playsinline muted></video>
+      <div class="cam-frame"><span>Fit the passport page inside the frame · good light, no glare</span></div>
+      <div class="cam-bar"><button data-cam="x">Cancel</button><button class="cam-shot" data-cam="go" aria-label="Take photo"></button><span class="cam-gap"></span></div>`;
+    document.body.appendChild(ov);
+    const video = ov.querySelector('video');
+    video.srcObject = stream;
+    const done = blob => { stream.getTracks().forEach(t => t.stop()); ov.remove(); resolve(blob); };
+    ov.querySelector('[data-cam=x]').onclick = () => done(null);
+    ov.querySelector('[data-cam=go]').onclick = () => {
+      const c = document.createElement('canvas');
+      c.width = video.videoWidth; c.height = video.videoHeight;
+      c.getContext('2d').drawImage(video, 0, 0);
+      c.toBlob(b => done(b), 'image/jpeg', 0.92);
+    };
+  });
+}
+
+// Passport machine-readable zone (ICAO TD3). Fields are trusted only when their check digit is valid.
+function parseMRZ(l1, l2) {
+  const clean = s => (s || '').toUpperCase().replace(/\s+/g, '').replace(/[«‹]/g, '<');
+  l1 = clean(l1); l2 = clean(l2);
+  const m = l2.match(/^([A-Z0-9<]{9})(\d)([A-Z<]{3})(\d{6})(\d)([MFX<])(\d{6})(\d)/);
+  if (!m) return null;
+  const val = c => (c === '<' ? 0 : /\d/.test(c) ? +c : c.charCodeAt(0) - 55);
+  const ok = (s, d) => [...s].reduce((t, c, i) => t + val(c) * [7, 3, 1][i % 3], 0) % 10 === +d;
+  const yy = new Date().getFullYear() % 100;
+  const date = (s, past) => { const y = +s.slice(0, 2); return `${(past ? (y > yy ? 1900 : 2000) : 2000) + y}-${s.slice(2, 4)}-${s.slice(4, 6)}`; };
+  const names = l1.startsWith('P') ? l1.slice(5).split('<<') : [];
+  return {
+    surname: (names[0] || '').replace(/</g, ' ').trim(), given: (names[1] || '').replace(/</g, ' ').trim(),
+    passport_no: ok(m[1], m[2]) ? m[1].replace(/</g, '') : null,
+    nationality: m[3].replace(/</g, ''),
+    dob: ok(m[4], m[5]) ? date(m[4], true) : null,
+    expiry: ok(m[7], m[8]) ? date(m[7], false) : null,
+  };
+}
+
+const titleCase = s => s.toLowerCase().replace(/(^|[\s'-])\p{L}/gu, ch => ch.toUpperCase());
+function isoDate(s) {
+  if (!s) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/); // DD/MM/YYYY as printed on Indian documents
+  return m ? `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}` : '';
+}
+const NATIONALITY = { IND: 'Indian', INDIAN: 'Indian', NPL: 'Nepalese', BGD: 'Bangladeshi', LKA: 'Sri Lankan', PAK: 'Pakistani' };
+
+// Auto-fetch: country / visa / applicant → document photos → AI OCR → review → pre-filled customer form
+function autoFetchCustomer() {
+  const images = []; // { name, data, kb }
+  modal({
+    title: '⚡ Auto-fetch customer details', wide: true,
+    body: `<div id="af-1">
+        <div class="step-h"><span>1</span>Visa</div>
+        <div class="grid3">
+          <div class="field"><label>Destination country *</label><select id="af-c">${countryOptions('')}</select></div>
+          <div class="field"><label>Visa type *</label><select id="af-v">${visaOptions('')}</select></div>
+          <div class="field"><label>Applicant *</label><select id="af-a">${optionList([], '', 'Select applicant')}
+            ${Object.entries(state.meta.applicant_types).map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('')}</select></div>
+        </div>
+        <div class="step-h"><span>2</span>Documents</div>
+        <div class="af-docs">
+          <label class="drop"><input type="file" accept="image/*" multiple hidden id="af-file">
+            <span class="ic">📄</span><b>Upload passport photo / scan</b><span class="small muted">Front page + address page · JPG, PNG</span></label>
+          <button type="button" class="drop" id="af-cam"><span class="ic">📷</span><b>Open camera</b><span class="small muted">Click a photo of the passport page</span></button>
+        </div>
+        <div class="thumbs" id="af-thumbs"></div>
+        <p class="small muted" style="margin:8px 0 0">Photos are sent to Cloudflare Workers AI only to read the text. They are not saved.</p>
+        <div class="ai-console" id="af-con" hidden><div class="ai-head"><span class="dot"></span><b>Document reader</b><span class="small" id="af-model"></span></div>
+          <div class="ai-log" id="af-log"></div></div>
+      </div>
+      <div id="af-2" hidden></div>`,
+    foot: `<button data-close>Cancel</button><button class="btn-ai" id="af-go" disabled>🔍 Extract details</button>`,
+    onMount: (el, close) => {
+      const $ = s => el.querySelector(s);
+      const sel = () => ({ country: $('#af-c').value, visa_type: $('#af-v').value, applicant_type: $('#af-a').value });
+      const canGo = () => { const k = sel(); $('#af-go').disabled = !(k.country && k.visa_type && k.applicant_type && images.length); };
+      ['#af-c', '#af-v', '#af-a'].forEach(s => $(s).addEventListener('change', canGo));
+      const drawThumbs = () => {
+        $('#af-thumbs').innerHTML = images.map((im, i) => `<div class="thumb"><img src="${im.data}" alt=""><span>${esc(im.name)}</span>
+          <button data-rm="${i}" aria-label="Remove">×</button></div>`).join('');
+        el.querySelectorAll('.thumb [data-rm]').forEach(b => b.onclick = () => { images.splice(+b.dataset.rm, 1); drawThumbs(); canGo(); });
+        canGo();
+      };
+      const addFile = async (file, name) => {
+        if (images.length >= 4) return toast('Up to 4 photos', true);
+        try {
+          const data = await imageToDataURL(file);
+          images.push({ name: name || file.name || 'Photo', data, kb: Math.round(file.size / 1024), outKb: Math.round(data.length * 3 / 4 / 1024) });
+          drawThumbs();
+        } catch { toast('Could not open this image. Use JPG or PNG.', true); }
+      };
+      $('#af-file').onchange = async e => { for (const f of e.target.files) await addFile(f); e.target.value = ''; };
+      $('#af-cam').onclick = async () => { const blob = await openCamera(); if (blob) addFile(blob, `Camera photo ${images.length + 1}`); };
+
+      let t0 = 0;
+      const log = (msg, cls = '') => {
+        const line = document.createElement('div');
+        line.className = 'l ' + cls;
+        line.innerHTML = `<span class="t">${((performance.now() - t0) / 1000).toFixed(1).padStart(5)}s</span> ${msg}`;
+        $('#af-log').appendChild(line);
+        $('#af-log').scrollTop = $('#af-log').scrollHeight;
+      };
+      const LABELS = { full_name: 'Name', passport_no: 'Passport no.', dob: 'Date of birth', date_of_expiry: 'Expiry', nationality: 'Nationality', address: 'Address' };
+
+      $('#af-go').onclick = async () => {
+        const k = sel();
+        $('#af-go').disabled = true;
+        $('#af-con').hidden = false; $('#af-con').classList.add('busy'); $('#af-log').innerHTML = '';
+        t0 = performance.now();
+        const merged = {};
+        let mrz = null;
+        log('▶ Starting document reading');
+        log(`• Visa: <b>${esc(checklistLabel(k))}</b> · ${images.length} photo(s)`);
+        try {
+          for (const [i, im] of images.entries()) {
+            log(`• Photo ${i + 1}/${images.length} "${esc(im.name)}" · optimised ${im.kb} KB → ${im.outKb} KB`);
+            log('• Sending to Cloudflare Workers AI vision model…');
+            const t = performance.now();
+            const r = await api('POST', '/api/ai/extract', { image: im.data });
+            $('#af-model').textContent = r.model;
+            const keys = Object.keys(r.fields);
+            log(`✓ ${esc(r.model.split('/').pop())} read the photo in ${((performance.now() - t) / 1000).toFixed(1)}s · ${keys.length} fields found`, 'ok');
+            for (const [f, label] of Object.entries(LABELS)) if (r.fields[f]) log(`&nbsp;&nbsp;${label}: <b>${esc(r.fields[f])}</b>`, 'dim');
+            for (const f of keys) if (!merged[f]) merged[f] = r.fields[f];
+            if (!mrz && r.fields.mrz_line2) mrz = parseMRZ(r.fields.mrz_line1, r.fields.mrz_line2);
+          }
+          if (mrz) {
+            const okN = ['passport_no', 'dob', 'expiry'].filter(f => mrz[f]).length;
+            log(okN ? `✓ Passport MRZ check digits verified for ${okN} of 3 fields` : '• MRZ found but check digits did not match; using printed details', okN ? 'ok' : 'warn');
+          } else {
+            log('• No readable MRZ (bottom lines of the passport); using printed details');
+          }
+          log('✓ Done. Review the details below.', 'ok');
+        } catch (e) {
+          log(`✕ ${esc(e.message)}`, 'err');
+          $('#af-con').classList.remove('busy');
+          $('#af-go').disabled = false;
+          if (!Object.keys(merged).length) return;
+        }
+        $('#af-con').classList.remove('busy');
+        showReview(k, merged, mrz);
+      };
+
+      // Step 3: review and correct what the AI read
+      const showReview = (k, f, mrz) => {
+        const name = f.full_name || [f.given_names, f.surname].filter(Boolean).join(' ') || (mrz ? `${mrz.given} ${mrz.surname}`.trim() : '');
+        const nat = (f.nationality || mrz?.nationality || '').toUpperCase();
+        const vals = {
+          full_name: { v: name ? titleCase(name) : '' },
+          passport_no: mrz?.passport_no ? { v: mrz.passport_no, ok: true } : { v: (f.passport_no || '').toUpperCase().replace(/\s/g, '') },
+          dob: mrz?.dob ? { v: mrz.dob, ok: true } : { v: isoDate(f.dob) },
+          passport_expiry: mrz?.expiry ? { v: mrz.expiry, ok: true } : { v: isoDate(f.date_of_expiry) },
+          nationality: { v: NATIONALITY[nat] || (nat ? titleCase(nat) : '') },
+          address: { v: f.address ? titleCase(f.address) : '' },
+        };
+        const badge = x => (x.ok ? '<span class="src ok">✓ MRZ verified</span>' : x.v ? '<span class="src ai">AI read</span>' : '<span class="src miss">not found</span>');
+        const field = (key, label, type = 'text') => `<div class="field"><label>${label} ${badge(vals[key])}</label>
+          ${type === 'area' ? `<textarea id="rv-${key}" rows="2" style="min-height:0">${esc(vals[key].v)}</textarea>`
+            : `<input id="rv-${key}" type="${type}" value="${esc(vals[key].v)}">`}</div>`;
+        const exp = vals.passport_expiry.v ? new Date(vals.passport_expiry.v) : null;
+        const sixMonths = new Date(); sixMonths.setMonth(sixMonths.getMonth() + 6);
+        $('#af-1').hidden = true;
+        $('#af-2').hidden = false;
+        $('#af-2').innerHTML = `<div class="step-h"><span>3</span>Review details</div>
+          <p class="muted small" style="margin-top:0">Check every field against the passport and correct anything the AI misread.</p>
+          ${exp && exp < sixMonths ? `<div class="hint warn" style="margin-bottom:12px">⚠ Passport expires on ${esc(vals.passport_expiry.v)}, less than 6 months from today. Most countries require 6 months validity.</div>` : ''}
+          <div class="grid2">${field('full_name', 'Full name')}${field('passport_no', 'Passport number')}
+            ${field('dob', 'Date of birth', 'date')}${field('passport_expiry', 'Passport expiry', 'date')}
+            ${field('nationality', 'Nationality')}<div class="field"><label>Visa</label><div class="hint">${esc(checklistLabel(k))}</div></div>
+            <div class="span2">${field('address', 'Address', 'area')}</div></div>`;
+        $('#af-go').disabled = false;
+        $('#af-go').className = 'btn-primary';
+        $('#af-go').textContent = '✓ Done · fill the form';
+        $('#af-go').onclick = () => {
+          const g = id => $(`#rv-${id}`).value.trim();
+          const first = (g('full_name').split(/\s+/)[0] || 'customer').toLowerCase().replace(/[^a-z0-9]/g, '');
+          const last = (g('full_name').split(/\s+/).slice(-1)[0] || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+          const prefill = {
+            ...k, full_name: g('full_name'), passport_no: g('passport_no').toUpperCase(), dob: g('dob'),
+            passport_expiry: g('passport_expiry'), nationality: g('nationality'), address: g('address'),
+            username: `${first}${last && last !== first ? '.' + last : ''}${Math.floor(10 + Math.random() * 90)}`.slice(0, 40),
+          };
+          close();
+          userFormModal('customer', null, prefill);
+          toast('Details filled. Add phone / email and press Create customer.');
+        };
+      };
+    },
+  });
+}
+
 function genPassword() {
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
   return Array.from(crypto.getRandomValues(new Uint32Array(10)), n => chars[n % chars.length]).join('');
@@ -512,7 +753,8 @@ function profileCard(c, editable) {
       ${editable ? `<button id="editc">Edit details</button>` : ''}</div>
     <div class="profile">${f('passport_no', 'Passport number')}${f('visa_type', 'Visa / Process')}${f('country', 'Destination')}
       <div><div class="k">Applicant</div><div class="v">${esc(applicantLabel(c.applicant_type)) || '<span class="muted">—</span>'}</div></div>
-      ${f('nationality', 'Nationality')}${f('dob', 'Date of birth')}${f('phone', 'Phone')}${f('email', 'Email')}</div>
+      ${f('passport_expiry', 'Passport expiry')}${f('nationality', 'Nationality')}${f('dob', 'Date of birth')}${f('phone', 'Phone')}${f('email', 'Email')}
+      ${c.address ? `<div style="grid-column:1/-1"><div class="k">Address</div><div class="v">${esc(c.address)}</div></div>` : ''}</div>
     <div style="margin-top:20px">${stageTracker(c.stage)}</div>
     ${c.notes ? `<div style="margin-top:16px;background:var(--primary-soft);padding:10px 12px;border-radius:8px"><b>Note from office:</b> ${esc(c.notes)}</div>` : ''}
   </div>`;
