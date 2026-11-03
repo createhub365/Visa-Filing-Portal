@@ -257,7 +257,9 @@ function showInstallBanner() {
   };
 }
 function hideInstallBanner() { document.getElementById('install')?.remove(); }
-window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvent = e; showInstallBanner(); });
+// Not calling preventDefault() lets Chrome show its own install bar automatically;
+// we also keep the event so our banner's Install button opens the same one-tap prompt.
+window.addEventListener('beforeinstallprompt', e => { installEvent = e; showInstallBanner(); });
 window.addEventListener('appinstalled', () => { installEvent = null; hideInstallBanner(); toast('App installed'); });
 if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
 
