@@ -32,11 +32,6 @@ const STAGES = [
   'Visa Rejected',
 ];
 
-const VISA_TYPES = [
-  'Tourist Visa', 'Visitor / Family Visit Visa', 'Business Visa', 'Student Visa', 'Work Visa',
-  'Dependent / Spouse Visa', 'Transit Visa', 'PR / Immigration',
-];
-
 const APPLICANT_TYPES = { salaried: 'Salaried person', business: 'Businessman / Self-employed' };
 
 // ------------------------------------------------------------------ errors --
@@ -289,7 +284,8 @@ const handlers = {
   },
 
   async me(ctx, user) {
-    return { user: userJson(user), reject_reasons: REJECT_REASONS, stages: STAGES, visa_types: VISA_TYPES, applicant_types: APPLICANT_TYPES };
+    const visaTypes = (await ctx.sb.select('visa_types', { select: 'name', order: 'id' })).map(v => v.name);
+    return { user: userJson(user), reject_reasons: REJECT_REASONS, stages: STAGES, visa_types: visaTypes, applicant_types: APPLICANT_TYPES };
   },
 
   async changePassword(ctx, user) {
@@ -508,8 +504,69 @@ const handlers = {
     return (await ctx.sb.insert('doc_types', { name }))[0];
   },
 
+  async renameDocType(ctx, user, { did }) {
+    const { sb } = ctx;
+    const name = str((await ctx.json()).name).slice(0, 200);
+    must(name, 400, 'Document name is required');
+    const old = await sb.one('doc_types', { id: eq(did) });
+    must(old, 404, 'Document type not found');
+    if (old.name === name) return { ...old, checklists: 0 };
+    try {
+      await sb.update('doc_types', { name }, { id: eq(did) });
+    } catch (e) {
+      if (e instanceof SupabaseError && e.code === '23505') throw new ApiError(400, `"${name}" already exists`);
+      throw e;
+    }
+    // existing checklists follow the new name; customers' own documents keep theirs
+    const checklists = await sb.rpc('rename_doc_in_checklists', { old_name: old.name, new_name: name });
+    return { id: did, name, checklists };
+  },
+
   async deleteDocType(ctx, user, { did }) {
     await ctx.sb.delete('doc_types', { id: eq(did) });
+    return { ok: true };
+  },
+
+  async listVisaTypes(ctx) {
+    return { visa_types: await ctx.sb.select('visa_types', { select: 'id,name', order: 'id' }) };
+  },
+
+  async addVisaType(ctx) {
+    const name = str((await ctx.json()).name).slice(0, 100);
+    must(name, 400, 'Visa type name is required');
+    try {
+      return (await ctx.sb.insert('visa_types', { name }))[0];
+    } catch (e) {
+      if (e instanceof SupabaseError && e.code === '23505') throw new ApiError(400, `"${name}" already exists`);
+      throw e;
+    }
+  },
+
+  async renameVisaType(ctx, user, { vid }) {
+    const { sb } = ctx;
+    const name = str((await ctx.json()).name).slice(0, 100);
+    must(name, 400, 'Visa type name is required');
+    const old = await sb.one('visa_types', { id: eq(vid) });
+    must(old, 404, 'Visa type not found');
+    if (old.name === name) return { ...old, checklists: 0, customers: 0 };
+    must(!(await sb.one('visa_types', { select: 'id', name: eq(name) })), 400, `"${name}" already exists`);
+    // checklists first: the only step that can conflict, so nothing is half-renamed if it does
+    let checklists;
+    try {
+      checklists = await sb.update('checklist_templates', { visa_type: name, updated_at: now() }, { visa_type: eq(old.name) });
+    } catch (e) {
+      if (e instanceof SupabaseError && e.code === '23505') {
+        throw new ApiError(400, `Checklists already exist for "${name}" with the same country and applicant. Remove those first.`);
+      }
+      throw e;
+    }
+    const customers = await sb.update('users', { visa_type: name }, { visa_type: eq(old.name) });
+    await sb.update('visa_types', { name }, { id: eq(vid) });
+    return { id: vid, name, checklists: checklists.length, customers: customers.length };
+  },
+
+  async deleteVisaType(ctx, user, { vid }) {
+    await ctx.sb.delete('visa_types', { id: eq(vid) });
     return { ok: true };
   },
 
@@ -695,7 +752,12 @@ const ROUTES = [
   ['DELETE', /^\/api\/checklists\/(?<cid>\d+)$/, 'deleteChecklist', [A]],
   ['GET', /^\/api\/doc-types$/, 'listDocTypes', [A]],
   ['POST', /^\/api\/doc-types$/, 'addDocType', [A]],
+  ['PUT', /^\/api\/doc-types\/(?<did>\d+)$/, 'renameDocType', [A]],
   ['DELETE', /^\/api\/doc-types\/(?<did>\d+)$/, 'deleteDocType', [A]],
+  ['GET', /^\/api\/visa-types$/, 'listVisaTypes', [A]],
+  ['POST', /^\/api\/visa-types$/, 'addVisaType', [A]],
+  ['PUT', /^\/api\/visa-types\/(?<vid>\d+)$/, 'renameVisaType', [A]],
+  ['DELETE', /^\/api\/visa-types\/(?<vid>\d+)$/, 'deleteVisaType', [A]],
   ['DELETE', /^\/api\/items\/(?<iid>\d+)$/, 'deleteItem', [A]],
   ['POST', /^\/api\/items\/(?<iid>\d+)\/upload$/, 'upload', ALL],
   ['GET', /^\/api\/items\/(?<iid>\d+)\/file$/, 'file', ALL],

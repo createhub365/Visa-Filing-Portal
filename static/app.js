@@ -114,10 +114,12 @@ function renderLogin(error = '') {
   $app.innerHTML = `<div class="login-wrap"><form class="login" id="lf">
     <div class="brand"><span class="logo">✈</span>Visa Filing Portal</div>
     <p class="muted" style="margin:0 0 20px">Sign in with the ID and password given by our office.</p>
+    ${canInstall() ? '<button type="button" class="install-inline" id="li">📲 Install as app on this phone</button>' : ''}
     ${error ? `<div class="error">${esc(error)}</div>` : ''}
     <div class="field"><label>Username</label><input name="username" autocomplete="username" required autofocus></div>
     <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div>
     <button class="btn-primary">Sign in</button></form></div>`;
+  document.getElementById('li')?.addEventListener('click', installApp);
   document.getElementById('lf').onsubmit = async e => {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -129,34 +131,122 @@ function renderLogin(error = '') {
 }
 
 // ------------------------------------------------------------------ shell --
+const ICONS = {
+  dashboard: '<path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/>',
+  customers: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.6 3.3-5.5 6.5-5.5s5.9 1.9 6.5 5.5"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14.8c2 .7 3.2 2.5 3.5 5.2"/>',
+  staff: '<rect x="4" y="3" width="16" height="18" rx="2.5"/><circle cx="12" cy="10" r="3"/><path d="M7.5 17.5c.8-2 2.4-3 4.5-3s3.7 1 4.5 3"/>',
+  checklists: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 3.5h6v2.5H9zM8.5 11l1.5 1.5 3-3M8.5 16.5l1.5 1.5 3-3M15 11.5h1M15 17h1"/>',
+  reviews: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  removals: '<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13M10 11v6M14 11v6"/>',
+  my: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/>',
+};
+const icon = name => `<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ''}</svg>`;
+
+// [hash, label, short label for the phone tab bar, badge count]
 function navFor(role) {
   if (role === 'admin') return [
-    ['#/dashboard', 'Dashboard'], ['#/customers', 'Customers'], ['#/staff', 'Staff'],
-    ['#/checklists', 'Checklists', state.counts.checklist_requests],
-    ['#/reviews', 'Review Queue', state.counts.in_review], ['#/removals', 'Removal Requests', state.counts.removals],
+    ['#/dashboard', 'Dashboard', 'Home'], ['#/customers', 'Customers', 'Customers'], ['#/staff', 'Staff', 'Staff'],
+    ['#/checklists', 'Checklists', 'Checklists', state.counts.checklist_requests],
+    ['#/reviews', 'Review Queue', 'Review', state.counts.in_review], ['#/removals', 'Removal Requests', 'Removals', state.counts.removals],
   ];
-  if (role === 'staff') return [['#/dashboard', 'Dashboard'], ['#/customers', 'Customers']];
-  return [['#/my', 'My Application']];
+  if (role === 'staff') return [['#/dashboard', 'Dashboard', 'Home'], ['#/customers', 'Customers', 'Customers']];
+  return [['#/my', 'My Application', 'My Application']];
 }
 function shell(content) {
   const me = state.me;
   const cur = location.hash.split('/').slice(0, 2).join('/');
-  const nav = navFor(me.role).map(([h, l, n]) =>
-    `<a href="${h}" class="${cur === h || (h === '#/customers' && cur === '#/customer') ? 'active' : ''}">${l}${n ? `<span class="count">${n}</span>` : ''}</a>`).join('');
+  const items = navFor(me.role);
+  const isOn = h => cur === h || (h === '#/customers' && cur === '#/customer');
+  const title = (items.find(([h]) => isOn(h)) || items[0])[1];
+  const badge = n => (n ? `<span class="count">${n}</span>` : '');
+  const nav = items.map(([h, l, , n]) => `<a href="${h}" class="${isOn(h) ? 'active' : ''}">${icon(h.slice(2))}<span class="lbl">${l}</span>${badge(n)}</a>`).join('');
+  const tabs = items.map(([h, , s, n]) => `<a href="${h}" class="${isOn(h) ? 'active' : ''}">${icon(h.slice(2))}<span>${s}</span>${badge(n)}</a>`).join('');
   $app.innerHTML = `<div class="shell">
-    <aside class="sidebar" id="sb">
-      <div class="brand"><span style="display:flex;gap:8px;align-items:center"><span class="logo">✈</span>Visa Portal</span>
-        <button class="menu-btn btn-sm" id="menu">☰</button></div>
+    <header class="appbar"><span class="logo">✈</span><span class="appbar-title">${esc(title)}</span>
+      <button class="avatar" id="acct" aria-label="Account">${esc(me.full_name.trim()[0] || '?').toUpperCase()}</button></header>
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">✈</span>Visa Portal</div>
       <nav class="nav">${nav}</nav>
       <div class="who"><b>${esc(me.full_name)}</b><span class="badge b-role">${esc(me.role)}</span>
         <button id="pw">Change password</button><button id="logout">Log out</button></div>
     </aside>
-    <main class="main" id="main">${content}</main></div>`;
-  document.getElementById('menu').onclick = () => document.getElementById('sb').classList.toggle('open');
-  document.getElementById('logout').onclick = async () => { await api('POST', '/api/logout'); state.me = null; location.hash = ''; renderLogin(); };
+    <main class="main" id="main">${content}</main>
+    ${items.length > 1 ? `<nav class="tabbar">${tabs}</nav>` : ''}</div>`;
+  document.getElementById('logout').onclick = logout;
   document.getElementById('pw').onclick = changePasswordModal;
+  document.getElementById('acct').onclick = accountSheet;
+  document.body.classList.toggle('has-tabbar', items.length > 1);
   return document.getElementById('main');
 }
+async function logout() {
+  await api('POST', '/api/logout');
+  state.me = null; location.hash = ''; renderLogin();
+}
+// phone: account menu as a bottom sheet
+function accountSheet() {
+  const me = state.me;
+  modal({
+    title: me.full_name,
+    body: `<div class="muted" style="margin:-6px 0 14px">@${esc(me.username)} · <span class="badge b-role">${esc(me.role)}</span></div>
+      <div class="sheet-list">
+        ${canInstall() ? '<button id="s-inst">📲 Install app on this phone</button>' : ''}
+        <button id="s-pw">🔑 Change password</button>
+        <button id="s-out" class="btn-red">↩ Log out</button></div>`,
+    onMount: (el, close) => {
+      el.querySelector('#s-pw').onclick = () => { close(); changePasswordModal(); };
+      el.querySelector('#s-out').onclick = () => { close(); logout(); };
+      const inst = el.querySelector('#s-inst');
+      if (inst) inst.onclick = () => { close(); installApp(); };
+    },
+  });
+}
+
+// ------------------------------------------------------- install as app --
+let installEvent = null;
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const canInstall = () => !isStandalone() && (installEvent || isIOS());
+function installApp() {
+  if (installEvent) {
+    installEvent.prompt();
+    installEvent.userChoice.finally(() => { installEvent = null; hideInstallBanner(); });
+  } else if (isIOS()) {
+    modal({
+      title: 'Install on iPhone / iPad',
+      body: `<ol class="steps"><li>Tap the <b>Share</b> button <span class="kbd">⬆︎</span> at the bottom of Safari.</li>
+        <li>Scroll and tap <b>Add to Home Screen</b>.</li><li>Tap <b>Add</b>. The Visa Portal icon appears on your home screen.</li></ol>`,
+      foot: '<button class="btn-primary" data-close>Got it</button>',
+    });
+  }
+}
+function showInstallBanner() {
+  let dismissed = false;
+  try { dismissed = sessionStorage.getItem('install-dismissed') === '1'; } catch { /* storage blocked */ }
+  if (dismissed || !canInstall() || document.getElementById('install')) return;
+  const el = document.createElement('div');
+  el.id = 'install';
+  el.innerHTML = `<span class="logo">✈</span><div style="flex:1"><b>Install Visa Portal</b><div class="small">Open it like an app from your home screen</div></div>
+    <button class="btn-primary btn-sm" id="inst-go">Install</button><button class="x" id="inst-x" aria-label="Close">×</button>`;
+  document.body.appendChild(el);
+  el.querySelector('#inst-go').onclick = installApp;
+  el.querySelector('#inst-x').onclick = () => {
+    try { sessionStorage.setItem('install-dismissed', '1'); } catch { /* storage blocked */ }
+    hideInstallBanner();
+  };
+}
+function hideInstallBanner() { document.getElementById('install')?.remove(); }
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvent = e; showInstallBanner(); });
+window.addEventListener('appinstalled', () => { installEvent = null; hideInstallBanner(); toast('App installed'); });
+if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+
+// phone: tables become cards; each cell gets its column name as a label
+new MutationObserver(() => {
+  document.querySelectorAll('table:not([data-labeled])').forEach(t => {
+    t.dataset.labeled = '1';
+    const heads = [...t.querySelectorAll('thead th')].map(th => th.textContent.trim());
+    t.querySelectorAll('tbody tr').forEach(tr => [...tr.children].forEach((td, i) => { if (heads[i]) td.dataset.label = heads[i]; }));
+  });
+}).observe(document.getElementById('app'), { childList: true, subtree: true });
 function changePasswordModal() {
   modal({
     title: 'Change password',
@@ -617,67 +707,140 @@ async function renderMy() {
 
 // ------------------------------------------------------------- checklists --
 async function renderChecklists() {
-  const [{ checklists }, { requests }, docTypes] = await Promise.all([
-    api('GET', '/api/checklists'), api('GET', '/api/checklist-requests'), loadDocTypes()]);
-  const findList = r => checklists.find(c => c.country === r.country && c.visa_type === r.visa_type && c.applicant_type === r.applicant_type);
+  const [{ checklists }, { requests }, { doc_types: docTypes }, { visa_types: visaTypes }] = await Promise.all([
+    api('GET', '/api/checklists'), api('GET', '/api/checklist-requests'), api('GET', '/api/doc-types'), api('GET', '/api/visa-types')]);
+  state.docTypes = docTypes;
+  state.meta.visa_types = visaTypes.map(v => v.name);
+  const tabs = [
+    ['checklists', 'Checklists', checklists.length, requests.length],
+    ['doctypes', 'Document types', docTypes.length],
+    ['visatypes', 'Visa types', visaTypes.length],
+  ];
   const main = shell(`<div class="page-head"><div><h1>Checklists</h1>
       <div class="muted">One checklist per country + visa type + applicant (salaried / business). New customers get it automatically.</div></div>
       <button class="btn-primary" id="make">+ Make checklist</button></div>
-    ${requests.length ? `<div class="card" style="border-color:#f0c78a"><div class="page-head" style="margin-bottom:8px"><h2>Checklist requests <span class="badge b-in_review">${requests.length}</span></h2>
+    <div class="tabs seg-tabs">${tabs.map(([k, l, n, alert]) =>
+      `<button data-tab="${k}">${l} <span class="muted">${n}</span>${alert ? ` <span class="count">${alert}</span>` : ''}</button>`).join('')}</div>
+    <div id="tabbody"></div>`);
+  const reload = () => { refreshCounts(); renderChecklists(); };
+  main.querySelector('#make').onclick = () => checklistBuilder(null, {}, reload);
+  const body = main.querySelector('#tabbody');
+  const usedIn = pred => checklists.filter(pred).length;
+  const show = tab => {
+    state.clTab = tab;
+    main.querySelectorAll('[data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+    if (tab === 'doctypes') {
+      namesTab(body, {
+        rows: docTypes, noun: 'document type', url: '/api/doc-types', reload,
+        intro: 'The documents you pick from when making a checklist. Renaming one also renames it inside every checklist that uses it.',
+        placeholder: 'New document type, e.g. Driving licence',
+        usage: name => usedIn(c => c.items.some(i => i.name === name)),
+        renamed: r => `Renamed${r.checklists ? ` · updated in ${r.checklists} checklist(s)` : ''}`,
+      });
+    } else if (tab === 'visatypes') {
+      namesTab(body, {
+        rows: visaTypes, noun: 'visa type', url: '/api/visa-types', reload,
+        intro: 'Visa types offered when making a checklist and creating a customer. Renaming one also updates its checklists and customers.',
+        placeholder: 'New visa type, e.g. Medical Visa',
+        usage: name => usedIn(c => c.visa_type === name),
+        renamed: r => `Renamed${r.checklists || r.customers ? ` · ${r.checklists} checklist(s), ${r.customers} customer(s) updated` : ''}`,
+      });
+    } else {
+      checklistsTab(body, checklists, requests, reload);
+    }
+  };
+  main.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => show(b.dataset.tab));
+  show(state.clTab || 'checklists');
+}
+
+function checklistsTab(body, checklists, requests, reload) {
+  const findList = r => checklists.find(c => c.country === r.country && c.visa_type === r.visa_type && c.applicant_type === r.applicant_type);
+  body.innerHTML = `${requests.length ? `<div class="card" style="border-color:#f0c78a"><div class="page-head" style="margin-bottom:8px"><h2>Checklist requests <span class="badge b-in_review">${requests.length}</span></h2>
         <span class="small muted">Creating a checklist applies it to every waiting customer with the same country, visa and applicant type.</span></div>
       <div class="table-wrap"><table><thead><tr><th>Customer</th><th>Needs checklist for</th><th>Requested by</th><th></th></tr></thead><tbody>
       ${requests.map((r, i) => `<tr><td><a href="#/customer/${r.customer_id}"><b>${esc(r.customer_name)}</b></a></td>
         <td>${esc(checklistLabel(r))}</td><td>${esc(r.by_name || '—')}<div class="small muted">${esc(r.by_role || '')} · ${fmtDate(r.created_at)}</div></td>
-        <td style="text-align:right">${findList(r) ? `<button class="btn-sm" data-apply="${r.customer_id}">Apply existing checklist</button>`
+        <td class="actions">${findList(r) ? `<button class="btn-sm" data-apply="${r.customer_id}">Apply existing checklist</button>`
           : `<button class="btn-sm btn-primary" data-req="${i}">Create checklist</button>`}</td></tr>`).join('')}
       </tbody></table></div></div>` : ''}
-    <div class="card"><div class="page-head" style="margin-bottom:8px"><h2>All checklists (${checklists.length})</h2>
-      <input id="q" placeholder="Search country or visa type…" style="width:260px"></div><div id="list"></div></div>
-    <div class="card"><h2>Document types</h2><p class="small muted" style="margin:4px 0 12px">The list you pick from when making a checklist. Custom documents you add there appear here too.</p>
-      <div class="chips" id="dts"></div>
-      <div class="toolbar" style="margin-top:12px"><input id="newdt" placeholder="New document type, e.g. Driving licence" style="width:320px"><button id="adddt">+ Add</button></div></div>`);
-  const reload = () => { refreshCounts(); renderChecklists(); };
-  main.querySelector('#make').onclick = () => checklistBuilder(null, {}, reload);
-  main.querySelectorAll('[data-req]').forEach(b => b.onclick = () => checklistBuilder(null, requests[+b.dataset.req], reload));
-  main.querySelectorAll('[data-apply]').forEach(b => b.onclick = async () => {
+    <div class="card"><div class="page-head" style="margin-bottom:8px"><h2>All checklists</h2>
+      <input id="q" class="search" placeholder="Search country or visa type…"></div><div id="list"></div></div>`;
+  body.querySelectorAll('[data-req]').forEach(b => b.onclick = () => checklistBuilder(null, requests[+b.dataset.req], reload));
+  body.querySelectorAll('[data-apply]').forEach(b => b.onclick = async () => {
     const r = await run(() => api('POST', `/api/customers/${b.dataset.apply}/apply-checklist`)); toast(`${r.added} documents added`); reload();
   });
   const drawList = () => {
-    const q = main.querySelector('#q').value.toLowerCase();
+    const q = body.querySelector('#q').value.toLowerCase();
     const rows = checklists.filter(c => `${c.country} ${c.visa_type}`.toLowerCase().includes(q));
-    main.querySelector('#list').innerHTML = !rows.length ? `<div class="empty">${checklists.length ? 'No match.' : 'No checklists yet. Press <b>+ Make checklist</b> to create the first one.'}</div>` :
+    body.querySelector('#list').innerHTML = !rows.length ? `<div class="empty">${checklists.length ? 'No match.' : 'No checklists yet. Press <b>+ Make checklist</b> to create the first one.'}</div>` :
       `<div class="table-wrap"><table><thead><tr><th>Country</th><th>Visa type</th><th>Applicant</th><th>Documents</th><th>Updated</th><th></th></tr></thead><tbody>
       ${rows.map(c => `<tr><td><b>${esc(c.country)}</b></td><td>${esc(c.visa_type)}</td>
         <td><span class="badge ${c.applicant_type === 'business' ? 'b-removal' : 'b-role'}">${esc(applicantLabel(c.applicant_type))}</span></td>
         <td>${c.items.length}</td><td class="small muted">${fmtDate(c.updated_at)}</td>
-        <td style="text-align:right;white-space:nowrap"><button class="btn-sm" data-edit="${c.id}">Edit</button>
+        <td class="actions"><button class="btn-sm" data-edit="${c.id}">Edit</button>
           <button class="btn-sm btn-red" data-del="${c.id}">Delete</button></td></tr>`).join('')}</tbody></table></div>`;
-    main.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => checklistBuilder(checklists.find(c => c.id === +b.dataset.edit), {}, reload));
-    main.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    body.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => checklistBuilder(checklists.find(c => c.id === +b.dataset.edit), {}, reload));
+    body.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
       const c = checklists.find(x => x.id === +b.dataset.del);
       if (!await confirmBox('Delete checklist', `Delete the checklist for <b>${esc(checklistLabel(c))}</b>? Customers who already have its documents keep them.`, 'Delete', true)) return;
       await run(() => api('DELETE', `/api/checklists/${c.id}`), 'Checklist deleted'); reload();
     });
   };
-  main.querySelector('#q').oninput = drawList;
+  body.querySelector('#q').oninput = drawList;
   drawList();
-  const drawTypes = () => {
-    main.querySelector('#dts').innerHTML = docTypes.map(d => `<span class="chip">${esc(d.name)}<button title="Remove from list" data-dt="${d.id}">×</button></span>`).join('');
-    main.querySelectorAll('[data-dt]').forEach(b => b.onclick = async () => {
-      await run(() => api('DELETE', `/api/doc-types/${b.dataset.dt}`));
-      docTypes.splice(docTypes.findIndex(d => d.id === +b.dataset.dt), 1); drawTypes();
+}
+
+// Add / rename / remove for a simple list of names (document types, visa types)
+function namesTab(body, cfg) {
+  const { rows, noun, url, reload, usage } = cfg;
+  const Noun = noun[0].toUpperCase() + noun.slice(1);
+  body.innerHTML = `<div class="card"><p class="muted" style="margin-top:0">${esc(cfg.intro)}</p>
+      <div class="toolbar"><input id="newname" placeholder="${esc(cfg.placeholder)}" style="flex:1;min-width:200px"><button class="btn-primary" id="addname">+ Add ${noun}</button></div></div>
+    <div class="card"><div class="page-head" style="margin-bottom:8px"><h2>${Noun}s</h2><input id="q" class="search" placeholder="Search…"></div><div id="list"></div></div>`;
+  const draw = () => {
+    const q = body.querySelector('#q').value.toLowerCase();
+    const list = rows.filter(r => r.name.toLowerCase().includes(q));
+    body.querySelector('#list').innerHTML = !list.length ? '<div class="empty">Nothing found.</div>' :
+      `<div class="table-wrap"><table><thead><tr><th>Name</th><th>Used in</th><th></th></tr></thead><tbody>
+      ${list.map(r => { const n = usage(r.name); return `<tr><td><b>${esc(r.name)}</b></td>
+        <td>${n ? `${n} checklist${n > 1 ? 's' : ''}` : '<span class="muted">Not used</span>'}</td>
+        <td class="actions"><button class="btn-sm" data-ren="${r.id}">Edit</button>
+          <button class="btn-sm btn-red" data-rm="${r.id}">Remove</button></td></tr>`; }).join('')}</tbody></table></div>`;
+    body.querySelectorAll('[data-ren]').forEach(b => b.onclick = () => {
+      const r = rows.find(x => x.id === +b.dataset.ren);
+      modal({
+        title: `Edit ${noun}`,
+        body: `<div class="field"><label>Name</label><input id="nm" value="${esc(r.name)}"></div>
+          ${usage(r.name) ? `<div class="hint">Used in ${usage(r.name)} checklist(s). They will be updated to the new name.</div>` : ''}`,
+        foot: `<button data-close>Cancel</button><button class="btn-primary" id="go">Save</button>`,
+        onMount: (el, close) => {
+          const inp = el.querySelector('#nm'); inp.focus(); inp.select();
+          el.querySelector('#go').onclick = async () => {
+            const res = await run(() => api('PUT', `${url}/${r.id}`, { name: inp.value }));
+            toast(cfg.renamed(res)); close(); reload();
+          };
+        },
+      });
+    });
+    body.querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => {
+      const r = rows.find(x => x.id === +b.dataset.rm);
+      const n = usage(r.name);
+      const msg = `Remove <b>${esc(r.name)}</b> from the ${noun} list?` +
+        (n ? `<br><br>It is used in <b>${n} checklist(s)</b>. Those checklists and customers keep it; it just won't be offered for new ones.` : '');
+      if (!await confirmBox(`Remove ${noun}`, msg, 'Remove', true)) return;
+      await run(() => api('DELETE', `${url}/${r.id}`), `${Noun} removed`); reload();
     });
   };
-  drawTypes();
-  const addType = async () => {
-    const inp = main.querySelector('#newdt');
-    if (!inp.value.trim()) return;
-    const d = await run(() => api('POST', '/api/doc-types', { name: inp.value }), 'Document type added');
-    if (!docTypes.some(x => x.id === d.id)) { docTypes.push(d); docTypes.sort((a, b) => a.name.localeCompare(b.name)); }
-    inp.value = ''; drawTypes();
+  body.querySelector('#q').oninput = draw;
+  draw();
+  const add = async () => {
+    const inp = body.querySelector('#newname');
+    if (!inp.value.trim()) return inp.focus();
+    await run(() => api('POST', url, { name: inp.value }), `${Noun} added`);
+    reload();
   };
-  main.querySelector('#adddt').onclick = addType;
-  main.querySelector('#newdt').onkeydown = e => { if (e.key === 'Enter') addType(); };
+  body.querySelector('#addname').onclick = add;
+  body.querySelector('#newname').onkeydown = e => { if (e.key === 'Enter') add(); };
 }
 
 // Make / edit a checklist: country → visa type → applicant → documents
@@ -786,3 +949,4 @@ async function renderRemovals() {
 }
 
 boot();
+if (isIOS()) showInstallBanner();
