@@ -204,20 +204,42 @@ function accountSheet() {
 // ------------------------------------------------------- install as app --
 let installEvent = null;
 const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-const canInstall = () => !isStandalone() && (installEvent || isIOS());
+const UA = navigator.userAgent;
+const isIOS = () => /iphone|ipad|ipod/i.test(UA) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isAndroid = () => /android/i.test(UA);
+// in-app browsers (WhatsApp, Instagram, Facebook...) cannot install apps
+const isInAppBrowser = () => /FBAN|FBAV|Instagram|Line\/|WhatsApp|Snapchat|; wv\)/i.test(UA);
+const isMobile = () => isIOS() || isAndroid();
+// Phones always get the option: the browser's own prompt when it offers one, otherwise step-by-step help
+const canInstall = () => !isStandalone() && (installEvent || isMobile());
+function installSteps() {
+  if (isInAppBrowser()) return { title: 'Open in your browser first', steps: [
+    'This page is open inside another app (WhatsApp, Instagram…), which cannot install apps.',
+    `Tap the menu <span class="kbd">⋮</span> or <span class="kbd">•••</span> and choose <b>Open in ${isIOS() ? 'Safari' : 'Chrome'}</b>.`,
+    'Then tap <b>Install</b> on the banner at the bottom.'] };
+  if (isIOS()) return { title: 'Install on iPhone / iPad', steps: [
+    `Tap the <b>Share</b> button <span class="kbd">⬆︎</span> (bottom of Safari, or top-right in Chrome).`,
+    'Scroll and tap <b>Add to Home Screen</b>.', 'Tap <b>Add</b>. The Visa Portal icon appears on your home screen.'] };
+  if (/SamsungBrowser/i.test(UA)) return { title: 'Install on Samsung Internet', steps: [
+    'Tap the menu <span class="kbd">≡</span> at the bottom right.', 'Tap <b>Add page to</b> → <b>Home screen</b>.',
+    'Tap <b>Add</b>. Open Visa Portal from the new icon.'] };
+  return { title: 'Install on Android', steps: [
+    'Tap the Chrome menu <span class="kbd">⋮</span> at the top right.',
+    'Tap <b>Install app</b> (or <b>Add to Home screen</b> → <b>Install</b>).',
+    'Open Visa Portal from the new icon on your home screen.'] };
+}
 function installApp() {
   if (installEvent) {
     installEvent.prompt();
     installEvent.userChoice.finally(() => { installEvent = null; hideInstallBanner(); });
-  } else if (isIOS()) {
-    modal({
-      title: 'Install on iPhone / iPad',
-      body: `<ol class="steps"><li>Tap the <b>Share</b> button <span class="kbd">⬆︎</span> at the bottom of Safari.</li>
-        <li>Scroll and tap <b>Add to Home Screen</b>.</li><li>Tap <b>Add</b>. The Visa Portal icon appears on your home screen.</li></ol>`,
-      foot: '<button class="btn-primary" data-close>Got it</button>',
-    });
+    return;
   }
+  const { title, steps } = installSteps();
+  modal({
+    title,
+    body: `<ol class="steps">${steps.map(s => `<li>${s}</li>`).join('')}</ol>`,
+    foot: '<button class="btn-primary" data-close>Got it</button>',
+  });
 }
 function showInstallBanner() {
   let dismissed = false;
@@ -949,4 +971,4 @@ async function renderRemovals() {
 }
 
 boot();
-if (isIOS()) showInstallBanner();
+if (isMobile()) showInstallBanner();
