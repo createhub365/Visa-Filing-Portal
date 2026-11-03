@@ -203,6 +203,47 @@ async function log(sb, customerId, userId, action, detail = '') {
   await sb.insert('activity', { customer_id: customerId, user_id: userId, action, detail });
 }
 
+function checkImage(ctx, image) {
+  must(ctx.env.AI, 500, 'Workers AI is not enabled for this Worker');
+  image = str(image);
+  must(/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image), 400, 'Send a JPG, PNG or WEBP image');
+  must(image.length <= MAX_OCR_IMAGE, 413, 'Image is too large. Use a smaller photo.');
+  return image;
+}
+
+// Ask a vision model about one image; tries the fallback model if the first fails. Returns the parsed JSON reply.
+async function runVision(env, prompt, image) {
+  let lastError;
+  for (const model of OCR_MODELS) {
+    try {
+      const out = await env.AI.run(model, {
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: image } }] }],
+        max_tokens: 700, temperature: 0,
+      });
+      const text = typeof out?.response === 'string' ? out.response : JSON.stringify(out?.response ?? out);
+      const m = text.match(/\{[\s\S]*\}/);
+      if (!m) { lastError = new Error('no JSON in reply'); continue; }
+      return { model, json: JSON.parse(m[0]) };
+    } catch (e) {
+      lastError = e;
+      console.error(`Vision model ${model} failed`, e);
+    }
+  }
+  const msg = String(lastError && lastError.message || lastError);
+  throw new ApiError(502, /limit|quota|neuron|capacity/i.test(msg)
+    ? 'Free AI limit for today is used up. Try again tomorrow or do it manually.'
+    : 'Could not read this image. Try a sharper, well-lit photo.');
+}
+
+function pickFields(raw, keys) {
+  const out = {};
+  for (const k of keys) {
+    const v = raw && raw[k];
+    if (v != null && String(v).trim() && !/^(null|n\/a|none|unknown)$/i.test(String(v).trim())) out[k] = String(v).trim().slice(0, 300);
+  }
+  return out;
+}
+
 const checklistLabel = c => `${c.country} · ${c.visa_type} · ${APPLICANT_TYPES[c.applicant_type] || c.applicant_type}`;
 
 async function findTemplate(sb, c) {
@@ -586,10 +627,7 @@ const handlers = {
   // Reads one document photo (passport page, ID card) and returns the text fields it can see.
   // The image is only sent to Workers AI for reading; it is not stored.
   async aiExtract(ctx) {
-    must(ctx.env.AI, 500, 'Workers AI is not enabled for this Worker');
-    const image = str((await ctx.json()).image);
-    must(/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image), 400, 'Send a JPG, PNG or WEBP image');
-    must(image.length <= MAX_OCR_IMAGE, 413, 'Image is too large. Use a smaller photo.');
+    const image = checkImage(ctx, (await ctx.json()).image);
     const prompt = [
       'You are an OCR engine for identity documents (passport data page, passport address page, national ID).',
       'Read the image and return ONLY one JSON object, no markdown, with exactly these keys:',
@@ -599,32 +637,48 @@ const handlers = {
       '(characters A-Z, 0-9 and <), copied character by character; full_name is given names followed by surname.',
       'Use null for anything not visible. Never guess.',
     ].join('\n');
-    let lastError;
-    for (const model of OCR_MODELS) {
-      try {
-        const out = await ctx.env.AI.run(model, {
-          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: image } }] }],
-          max_tokens: 700, temperature: 0,
-        });
-        const text = typeof out?.response === 'string' ? out.response : JSON.stringify(out?.response ?? out);
-        const m = text.match(/\{[\s\S]*\}/);
-        if (!m) { lastError = new Error('no JSON in reply'); continue; }
-        const raw = JSON.parse(m[0]);
-        const fields = {};
-        for (const k of OCR_FIELDS) {
-          const v = raw[k];
-          if (v != null && String(v).trim() && !/^(null|n\/a|none|unknown)$/i.test(String(v).trim())) fields[k] = String(v).trim().slice(0, 300);
-        }
-        return { model, fields };
-      } catch (e) {
-        lastError = e;
-        console.error(`OCR with ${model} failed`, e);
-      }
-    }
-    const msg = String(lastError && lastError.message || lastError);
-    throw new ApiError(502, /limit|quota|neuron|capacity/i.test(msg)
-      ? 'Free AI limit for today is used up. Fill the details manually or try tomorrow.'
-      : 'Could not read this image. Try a sharper, well-lit photo of the passport page.');
+    const { model, json } = await runVision(ctx.env, prompt, image);
+    return { model, fields: pickFields(json, OCR_FIELDS) };
+  },
+
+  // Smart upload: what document is this, whose is it, and which checklist item does it satisfy?
+  async aiClassify(ctx) {
+    const b = await ctx.json();
+    const image = checkImage(ctx, b.image);
+    const checklist = (Array.isArray(b.checklist) ? b.checklist : []).map(str).filter(Boolean).slice(0, 100);
+    const prompt = [
+      'You sort documents for an Indian visa application. Look at the image and return ONLY one JSON object, no markdown:',
+      '{"document_type": "...", "person_name": "...", "matched_item": "...", "confidence": 0.0}',
+      '- document_type: short standard name, e.g. Passport, Aadhaar card, PAN card, Bank statement, Salary slip,',
+      '  Form 16, Income tax return, Offer letter, Marriage certificate, Birth certificate, Photograph, Flight ticket.',
+      '- person_name: full name of the person the document belongs to, exactly as printed (null if none).',
+      '- matched_item: the EXACT text of the one checklist item below that this document satisfies, or null if none fits.',
+      '- confidence: 0 to 1, how sure you are about document_type.',
+      'Checklist items:',
+      ...(checklist.length ? checklist.map(n => `- ${n}`) : ['(empty)']),
+    ].join('\n');
+    const { model, json } = await runVision(ctx.env, prompt, image);
+    const f = pickFields(json, ['document_type', 'person_name', 'matched_item']);
+    const matched = f.matched_item && checklist.find(n => n.toLowerCase() === f.matched_item.toLowerCase());
+    return {
+      model, document_type: f.document_type || null, person_name: f.person_name || null,
+      matched_item: matched || null, confidence: Math.max(0, Math.min(1, +json.confidence || 0)),
+    };
+  },
+
+  // Smart upload: an extra document the checklist did not ask for gets its own item
+  async smartItem(ctx, user, { uid }) {
+    const { sb } = ctx;
+    must(canAccessCustomer(user, uid), 403, 'Not allowed');
+    must(await sb.one('users', { select: 'id', id: eq(uid), role: eq('customer') }), 404, 'Customer not found');
+    const name = str((await ctx.json()).name).slice(0, 200);
+    must(name, 400, 'Document name is required');
+    const existing = (await sb.select('checklist_items', { select: '*', customer_id: eq(uid) }))
+      .find(i => i.name.toLowerCase() === name.toLowerCase());
+    if (existing) return { id: existing.id, name: existing.name, created: false };
+    const row = (await sb.insert('checklist_items', { customer_id: uid, name, description: 'Extra document (added by Smart upload)' }))[0];
+    await log(sb, uid, user.id, 'Checklist updated', `Smart upload added: ${name}`);
+    return { id: row.id, name: row.name, created: true };
   },
 
   async listVisaTypes(ctx) {
@@ -856,6 +910,8 @@ const ROUTES = [
   ['DELETE', /^\/api\/doc-types\/(?<did>\d+)$/, 'deleteDocType', [A]],
   ['POST', /^\/api\/ai\/checklist$/, 'aiChecklist', [A]],
   ['POST', /^\/api\/ai\/extract$/, 'aiExtract', [A, S]],
+  ['POST', /^\/api\/ai\/classify$/, 'aiClassify', ALL],
+  ['POST', /^\/api\/customers\/(?<uid>\d+)\/smart-item$/, 'smartItem', ALL],
   ['GET', /^\/api\/visa-types$/, 'listVisaTypes', [A]],
   ['POST', /^\/api\/visa-types$/, 'addVisaType', [A]],
   ['PUT', /^\/api\/visa-types\/(?<vid>\d+)$/, 'renameVisaType', [A]],

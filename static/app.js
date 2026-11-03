@@ -924,6 +924,7 @@ async function renderCustomer(id) {
     ${profileCard(c, isAdmin)}
     <div class="card"><div class="page-head" style="margin-bottom:12px"><div><h2>Document checklist</h2><div style="margin-top:6px">${checklistSummary(data.progress)}</div></div>
       ${isAdmin ? `<div class="toolbar">${data.checklist_available && data.items.length ? '<button id="applycl">Apply checklist</button>' : ''}<button class="btn-primary" id="additem">+ Add document</button></div>` : ''}</div>
+      ${smartBar(false)}
       <div class="checklist">${data.items.length ? data.items.map(it => docCard(it, role)).join('') : noChecklistBox(c, data, role)}</div></div>
     <div class="card"><h2 style="margin-bottom:8px">Activity</h2><ul class="activity">
       ${data.activity.map(a => `<li><b>${esc(a.action)}</b>${a.detail ? ` — ${esc(a.detail)}` : ''}<div class="small muted">${fmtDate(a.at)}${a.by_name ? ` · ${esc(a.by_name)} (${esc(a.by_role)})` : ''}</div></li>`).join('') || '<li class="muted">No activity yet.</li>'}
@@ -931,6 +932,7 @@ async function renderCustomer(id) {
   const reload = () => { refreshCounts(); renderCustomer(id); };
   bindDocActions(main, data.items, reload);
   bindNoChecklist(main, c, reload);
+  bindSmartUpload(main, c, data.items, reload);
   if (!isAdmin) return;
   main.querySelector('#editc').onclick = () => userFormModal('customer', c);
   main.querySelector('#stage').onchange = async e => { await run(() => api('PUT', `/api/users/${id}`, { stage: e.target.value }), 'Stage updated'); reload(); };
@@ -965,10 +967,12 @@ async function renderMy() {
     <div class="card"><div class="page-head" style="margin-bottom:12px"><div><h2>Your document checklist</h2>
       <div class="small muted" style="margin-top:2px">${p.accepted} of ${p.total} documents accepted</div></div>${checklistSummary(p)}</div>
       <div style="margin-bottom:14px">${progressBar(p)}</div>
+      ${smartBar(true)}
       <div class="checklist">${data.items.length ? data.items.map(it => docCard(it, 'customer')).join('') : noChecklistBox(c, data, 'customer')}</div>
       <p class="small muted" style="margin-bottom:0">Accepted formats: PDF, JPG, PNG, WEBP · max 10 MB. To remove an uploaded document, press Remove — the request goes to our admin for approval.</p></div>`);
   bindDocActions(main, data.items, renderMy);
   bindNoChecklist(main, c, renderMy);
+  bindSmartUpload(main, c, data.items, renderMy);
 }
 
 // ------------------------------------------------------------- checklists --
@@ -1295,6 +1299,248 @@ async function checklistBuilder(existing, prefill = {}, onSaved) {
         toast(`Checklist saved${r.applied_to ? ` · applied to ${r.applied_to} waiting customer(s)` : ''}`);
         close(); onSaved && onSaved();
       };
+    },
+  });
+}
+
+// ------------------------------------------------------------ smart upload --
+// Select many documents at once; AI says what each is and whose it is, then it is filed into the checklist.
+const SMART_ACCEPT = '.pdf,.jpg,.jpeg,.png,.webp';
+function smartBar(forCustomer) {
+  return `<div class="smart-bar"><div class="sb-ic">⚡</div><div style="flex:1;min-width:200px"><b>Smart upload</b><div class="small">${forCustomer
+    ? 'Select all your documents at once. The system reads each one and puts it in the right place.'
+    : "Select all of the customer's documents at once. AI reads each one, checks the name and files it into the checklist."}</div></div>
+    <button class="btn-ai" data-smart>Select documents</button></div>`;
+}
+function bindSmartUpload(root, customer, items, reload) {
+  const b = root.querySelector('[data-smart]');
+  if (!b) return;
+  b.onclick = () => {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.multiple = true; inp.accept = SMART_ACCEPT;
+    inp.onchange = () => { if (inp.files.length) smartUpload(customer, items, [...inp.files], reload); };
+    inp.click();
+  };
+}
+
+const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174';
+let pdfjsPromise = null;
+function loadPdfJs() {
+  pdfjsPromise = pdfjsPromise || new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = `${PDFJS}/pdf.min.js`;
+    s.onload = () => {
+      // a cross-origin worker URL cannot be started directly; a same-origin blob that imports it can
+      const boot = new Blob([`importScripts('${PDFJS}/pdf.worker.min.js');`], { type: 'application/javascript' });
+      window.pdfjsLib.GlobalWorkerOptions.workerPort = new Worker(URL.createObjectURL(boot));
+      resolve(window.pdfjsLib);
+    };
+    s.onerror = () => { pdfjsPromise = null; reject(new Error('Could not load the PDF reader')); };
+    document.head.appendChild(s);
+  });
+  return pdfjsPromise;
+}
+const withTimeout = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} took too long`)), ms))]);
+// First page of a PDF as a JPEG, so the vision model can read it
+async function pdfFirstPage(file, max = 1600) {
+  const pdfjs = await withTimeout(loadPdfJs(), 20000, 'Loading the PDF reader');
+  const pdf = await withTimeout(pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), standardFontDataUrl: `${PDFJS}/standard_fonts/` }).promise, 30000, 'Opening the PDF');
+  const page = await pdf.getPage(1);
+  const base = page.getViewport({ scale: 1 });
+  const vp = page.getViewport({ scale: Math.min(2.5, max / Math.max(base.width, base.height)) });
+  const c = document.createElement('canvas');
+  c.width = vp.width; c.height = vp.height;
+  // 'print' renders without requestAnimationFrame, so it also finishes in a background tab
+  await withTimeout(page.render({ canvasContext: c.getContext('2d'), viewport: vp, intent: 'print' }).promise, 30000, 'Reading the PDF page');
+  return { data: c.toDataURL('image/jpeg', 0.85), pages: pdf.numPages };
+}
+
+const normText = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const NAME_TITLES = new Set(['mr', 'mrs', 'ms', 'miss', 'shri', 'sri', 'smt', 'kumari', 'dr', 'master']);
+const nameTokens = s => normText(s).split(' ').filter(t => t.length > 1 && !NAME_TITLES.has(t));
+// true = same person, false = different name, null = no name to compare
+function nameMatches(docName, customerName) {
+  const a = nameTokens(docName), b = new Set(nameTokens(customerName));
+  if (!a.length || !b.size) return null;
+  const hits = a.filter(t => b.has(t)).length;
+  return hits >= Math.min(2, a.length, b.size);
+}
+// AI's pick first, then a plain text match ("Passport" ↔ "Passport (first & last page)")
+function findChecklistItem(items, docType, aiPick) {
+  if (aiPick) { const hit = items.find(i => i.name === aiPick); if (hit) return hit; }
+  const d = normText(docType);
+  if (!d) return null;
+  return items.find(i => normText(i.name) === d)
+    || items.find(i => normText(i.name).startsWith(d + ' ') || d.startsWith(normText(i.name) + ' '))
+    || items.find(i => normText(i.name).includes(d))
+    || null;
+}
+
+// an item can take a file when it is empty or its document was rejected (and no removal is pending)
+const fillable = it => (!it.has_file || it.status === 'rejected') && !it.removal_request;
+
+function smartUpload(customer, startItems, files, reload) {
+  const items = startItems.map(i => ({ ...i }));
+  const usedNow = new Set(); // item ids filled during this run
+  const rows = files.map(f => ({ file: f, state: 'wait', text: 'Waiting', type: '', person: '' }));
+  const stats = { uploaded: 0, created: 0, skipped: 0, hold: 0, failed: 0 };
+  let t0 = performance.now(), running = true;
+  modal({
+    title: `⚡ Smart upload · ${customer.full_name}`, wide: true,
+    body: `<div class="ai-console busy" id="su-con"><div class="ai-head"><span class="dot"></span><b>Smart document sorter</b><span class="small" id="su-model"></span></div>
+        <div class="ai-log" id="su-log"></div></div>
+      <div class="su-list" id="su-list"></div>
+      <p class="small muted" style="margin-bottom:0">AI can make mistakes. Uploaded documents still go to <b>In Review</b> for the admin to check.</p>`,
+    foot: `<button class="btn-primary" id="su-done" disabled>Processing…</button>`,
+    onMount: (el, close) => {
+      const $ = s => el.querySelector(s);
+      const log = (msg, cls = '') => {
+        const line = document.createElement('div');
+        line.className = 'l ' + cls;
+        line.innerHTML = `<span class="t">${((performance.now() - t0) / 1000).toFixed(1).padStart(5)}s</span> ${msg}`;
+        $('#su-log').appendChild(line);
+        $('#su-log').scrollTop = $('#su-log').scrollHeight;
+      };
+      const ICON = { wait: '⏳', work: '🔄', ok: '✅', hold: '⚠️', err: '❌', skip: '⏭️' };
+      const itemOptions = () => items.map(i => `<option value="${i.id}" ${fillable(i) ? '' : 'disabled'}>${esc(i.name)}${fillable(i) ? '' : ' (has a file)'}</option>`).join('');
+      const drawRow = i => {
+        const r = rows[i];
+        let node = el.querySelector(`.su-row[data-i="${i}"]`);
+        if (!node) { node = document.createElement('div'); node.className = 'su-row'; node.dataset.i = i; $('#su-list').appendChild(node); }
+        node.className = `su-row ${r.state}`;
+        node.innerHTML = `<span class="su-ic">${ICON[r.state]}</span>
+          <div class="su-main"><div class="su-name">${esc(r.file.name)}</div>
+            <div class="small">${r.type ? `<b>${esc(r.type)}</b>` : ''}${r.person ? ` · ${esc(r.person)}` : ''}${r.type || r.person ? ' · ' : ''}${r.text}</div>
+            ${r.state === 'hold' ? `<div class="su-act">
+              <select data-pick>${r.target ? '' : '<option value="">Choose checklist item…</option>'}${itemOptions()}<option value="new">+ New item "${esc(r.type || r.file.name.replace(/\.[^.]+$/, ''))}"</option></select>
+              <button class="btn-sm btn-primary" data-go>Upload anyway</button><button class="btn-sm" data-skip>Skip</button></div>` : ''}</div>`;
+        if (r.state === 'hold') {
+          const pick = node.querySelector('[data-pick]');
+          if (r.target) pick.value = String(r.target.id);
+          node.querySelector('[data-skip]').onclick = () => { r.state = 'skip'; r.text = 'Skipped by you'; stats.hold--; stats.skipped++; drawRow(i); finish(); };
+          node.querySelector('[data-go]').onclick = async () => {
+            const v = pick.value;
+            if (!v) return toast('Choose a checklist item first', true);
+            stats.hold--;
+            await place(i, v === 'new' ? null : items.find(x => x.id === +v), true);
+            finish();
+          };
+        }
+      };
+      rows.forEach((_, i) => drawRow(i));
+
+      const upload = async (i, item) => {
+        const r = rows[i];
+        const fd = new FormData();
+        fd.append('file', r.file);
+        await api('POST', `/api/items/${item.id}/upload`, fd);
+        item.has_file = true; item.status = 'in_review';
+        usedNow.add(item.id);
+        stats.uploaded++;
+        r.state = 'ok'; r.text = `Uploaded to <b>${esc(item.name)}</b> · In review`;
+        log(`✓ Uploaded "${esc(r.file.name)}" → <b>${esc(item.name)}</b>`, 'ok');
+        drawRow(i);
+      };
+      // put file i into item (or a new extra item when item is null / already filled this run)
+      const place = async (i, item, confirmed = false) => {
+        const r = rows[i];
+        r.state = 'work'; r.text = 'Uploading…'; drawRow(i);
+        try {
+          if (item && !fillable(item) && !usedNow.has(item.id) && !confirmed) {
+            r.state = 'skip'; r.text = `<b>${esc(item.name)}</b> already has a document · skipped`;
+            stats.skipped++; log(`= "${esc(r.file.name)}": ${esc(item.name)} already uploaded earlier · skipped`, 'dim');
+            return drawRow(i);
+          }
+          if (!item || !fillable(item)) {
+            // not asked for in the checklist (or a second page of the same document): add it as an extra item
+            const base = item ? `${item.name} – additional` : (r.type || titleCase(r.file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ')));
+            const made = await api('POST', `/api/customers/${customer.id}/smart-item`, { name: base });
+            let target = items.find(x => x.id === made.id);
+            if (!target) { target = { id: made.id, name: made.name, status: 'pending', has_file: false }; items.push(target); }
+            if (made.created) { stats.created++; log(`＋ ${item ? 'Another page / copy' : 'Not in checklist'} → added custom item <b>${esc(made.name)}</b>`, 'new'); }
+            if (!fillable(target)) {
+              r.state = 'skip'; r.text = `<b>${esc(target.name)}</b> already has a document · skipped`; stats.skipped++;
+              return drawRow(i);
+            }
+            item = target;
+          }
+          await upload(i, item);
+        } catch (e) {
+          r.state = 'err'; r.text = esc(e.message); stats.failed++;
+          log(`✕ "${esc(r.file.name)}": ${esc(e.message)}`, 'err');
+          drawRow(i);
+        }
+      };
+      const hold = (i, why) => {
+        const r = rows[i];
+        r.state = 'hold'; r.text = why; stats.hold++;
+        drawRow(i);
+      };
+      const finish = () => {
+        if (running || stats.hold > 0) {
+          $('#su-done').disabled = running;
+          $('#su-done').textContent = running ? 'Processing…' : `Done (${stats.hold} waiting for you)`;
+          if (running) return;
+        }
+        $('#su-done').disabled = false;
+        if (!stats.hold) $('#su-done').textContent = 'Done';
+      };
+
+      (async () => {
+        log(`▶ Smart upload started · ${files.length} file(s) for <b>${esc(customer.full_name)}</b>`);
+        log(`• Checklist has ${items.length} item(s) · ${items.filter(fillable).length} still need a document`);
+        for (const [i, r] of rows.entries()) {
+          const f = r.file;
+          const ext = (f.name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
+          log(`• File ${i + 1}/${rows.length}: "${esc(f.name)}" (${Math.max(1, Math.round(f.size / 1024))} KB)`);
+          if (!SMART_ACCEPT.split(',').includes(ext)) { r.state = 'err'; r.text = 'Only PDF, JPG, PNG or WEBP'; stats.failed++; drawRow(i); log('✕ File type not allowed', 'err'); continue; }
+          if (f.size > 10 * 1024 * 1024) { r.state = 'err'; r.text = 'Larger than 10 MB'; stats.failed++; drawRow(i); log('✕ File is larger than 10 MB', 'err'); continue; }
+          r.state = 'work'; r.text = 'Reading…'; drawRow(i);
+          let image;
+          try {
+            if (ext === '.pdf') {
+              log('&nbsp;&nbsp;Rendering PDF page 1 for the AI…', 'dim');
+              const p = await pdfFirstPage(f);
+              image = p.data;
+              log(`&nbsp;&nbsp;PDF has ${p.pages} page(s); reading page 1`, 'dim');
+            } else {
+              image = await imageToDataURL(f);
+            }
+          } catch (e) {
+            log(`⚠ Could not open "${esc(f.name)}"${/password/i.test(e.name + e.message) ? ' (password-protected PDF)' : ''}. Choose where it goes.`, 'warn');
+            hold(i, /password/i.test(e.name + e.message) ? 'Password-protected PDF, AI cannot read it. Choose the checklist item:' : 'Could not read this file. Choose the checklist item:');
+            continue;
+          }
+          try {
+            const t = performance.now();
+            const ai = await api('POST', '/api/ai/classify', { image, checklist: items.map(x => x.name) });
+            $('#su-model').textContent = ai.model;
+            r.type = (ai.document_type || '').trim(); // keep acronyms like PAN, ITR as written
+            r.person = ai.person_name ? titleCase(ai.person_name) : '';
+            log(`&nbsp;&nbsp;AI (${((performance.now() - t) / 1000).toFixed(1)}s): <b>${esc(r.type || 'unknown document')}</b>${r.person ? ` · name <b>${esc(r.person)}</b>` : ''} · ${Math.round(ai.confidence * 100)}% sure`);
+            if (!r.type) { hold(i, 'AI could not tell what this document is. Choose the checklist item:'); continue; }
+            const match = nameMatches(ai.person_name, customer.full_name);
+            const target = findChecklistItem(items, ai.document_type, ai.matched_item);
+            r.target = target;
+            if (match === false) {
+              log(`⚠ Name on document "${esc(r.person)}" does not match customer "${esc(customer.full_name)}". Waiting for your decision.`, 'warn');
+              hold(i, `Name does not match <b>${esc(customer.full_name)}</b>. Upload anyway?`);
+              continue;
+            }
+            log(match ? `&nbsp;&nbsp;✓ Name matches the customer` : '&nbsp;&nbsp;• No name on this document to check', match ? 'ok' : 'dim');
+            log(target ? `&nbsp;&nbsp;→ Checklist item: <b>${esc(target.name)}</b>` : '&nbsp;&nbsp;→ Not in the checklist', 'dim');
+            await place(i, target);
+          } catch (e) {
+            log(`✕ "${esc(f.name)}": ${esc(e.message)}`, 'err');
+            hold(i, `${esc(e.message)} Choose the checklist item:`);
+          }
+        }
+        running = false;
+        $('#su-con').classList.remove('busy');
+        log(`✓ Finished in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${stats.uploaded} uploaded · ${stats.created} new item(s) · ${stats.skipped} skipped · ${stats.failed} failed${stats.hold ? ` · <b>${stats.hold} waiting for you</b>` : ''}`, 'ok');
+        finish();
+      })();
+      $('#su-done').onclick = () => { close(); reload(); };
     },
   });
 }

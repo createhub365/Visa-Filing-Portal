@@ -40,6 +40,10 @@ Live: https://visa-filing-portal.createhub365.workers.dev
   a vision model (Llama 4 Scout, fallback Mistral Small 3.1) reads name, passport no., DOB, expiry, nationality and
   address. Passport no., DOB and expiry are marked **MRZ verified** only when the passport's MRZ check digits match.
   The admin/staff reviews the fields, then the normal customer form opens pre-filled. Photos are not stored.
+- **Smart upload** (customer page, above the checklist; admin, staff and customers): select many files (images or PDFs)
+  at once. For each file the vision model names the document type and the person on it; the name is compared with the
+  customer, the file is uploaded into the matching checklist item, and documents the checklist did not ask for get a
+  new custom item. Name mismatches and unreadable files wait for a decision. PDFs are read from page 1 (pdf.js, cdnjs).
 
 ## Document flow
 
