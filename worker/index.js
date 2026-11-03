@@ -549,8 +549,9 @@ function jsonResponse(status, obj, cookies = []) {
 }
 
 async function handleApi(request, env, url) {
-  if (!env.SUPABASE_URL || !env.SUPABASE_SECRET_KEY) {
-    return jsonResponse(500, { error: 'Server not configured: set SUPABASE_URL and the SUPABASE_SECRET_KEY secret' });
+  const missing = ['SUPABASE_URL', 'SUPABASE_SECRET_KEY'].filter(k => !env[k]);
+  if (missing.length) {
+    return jsonResponse(500, { error: `Server not configured: missing ${missing.join(' and ')} (Worker → Settings → Variables and Secrets)` });
   }
   const cookies = [];
   let body;
