@@ -202,15 +202,28 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def hash_password(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
-    return f"{salt}${digest}"
+ITERATIONS = 100_000  # Cloudflare Workers' WebCrypto caps PBKDF2 at 100k; keep both backends compatible
+
+
+def hash_password(password):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), ITERATIONS).hex()
+    return f"pbkdf2_sha256${ITERATIONS}${salt}${digest}"
 
 
 def check_password(password, stored):
-    salt, _ = stored.split("$", 1)
-    return hmac.compare_digest(hash_password(password, salt), stored)
+    parts = stored.split("$")
+    if len(parts) == 2:  # legacy format: salt$digest at 200k iterations
+        salt, digest, iterations = parts[0], parts[1], 200_000
+    else:
+        _, iterations, salt, digest = parts
+        iterations = int(iterations)
+    calc = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), iterations).hex()
+    return hmac.compare_digest(calc, digest)
+
+
+def needs_rehash(stored):
+    return not stored.startswith(f"pbkdf2_sha256${ITERATIONS}$")
 
 
 def init_db():
@@ -329,6 +342,8 @@ def h_login(req, user):
     row = sb.one("users", {"username": eq((body.get("username") or "").strip())})
     require(row and check_password(body.get("password") or "", row["pw"]), 401, "Invalid username or password")
     require(row["active"], 403, "This account is disabled. Contact the office.")
+    if needs_rehash(row["pw"]):  # upgrade old hashes so the Cloudflare Worker can verify them too
+        sb.update("users", {"pw": hash_password(body["password"])}, {"id": eq(row["id"])})
     token = secrets.token_urlsafe(32)
     sb.insert("sessions", {"token": token, "user_id": row["id"]})
     req.set_cookie(f"sid={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800{COOKIE_SECURE}")

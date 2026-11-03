@@ -3,8 +3,25 @@
 Login-based web app for visa filing: admin panel, staff, and customer portal with document checklist,
 upload, admin review (accept / reject with reasons) and approval-based document removal.
 
-- **Server:** Python 3.9+ standard library only. Nothing to install.
+- **Production:** Cloudflare Worker ([worker/index.js](worker/index.js)) serving `static/` + the `/api` backend.
+- **Local:** Python 3.9+ server ([app.py](app.py)), standard library only. Same API, same database.
 - **Database:** Supabase PostgreSQL. **Documents:** Supabase Storage (private bucket `documents`).
+
+When you change backend behaviour, change it in **both** `worker/index.js` and `app.py`.
+
+## Deploy to Cloudflare (Workers Builds from GitHub)
+
+1. Cloudflare dashboard → **Workers & Pages** → **Create** → **Import a repository** → pick this GitHub repo.
+2. Project name: `visa-filing-portal` (must match `name` in [wrangler.jsonc](wrangler.jsonc)).
+   Build command: *(empty)* · Deploy command: `npx wrangler deploy` · Root directory: `/`.
+3. After the first deploy: Worker → **Settings → Variables and Secrets** → **Add** → type **Secret**,
+   name `SUPABASE_SECRET_KEY`, value = Supabase secret key → **Deploy**.
+4. Every push to `main` redeploys automatically.
+
+`SUPABASE_URL`, `SUPABASE_BUCKET` and `COOKIE_SECURE` are plain vars in `wrangler.jsonc`.
+
+Passwords use PBKDF2-SHA256 with 100,000 iterations (the Workers limit). Accounts created before this format
+(`salt$hash`) can't log in on Cloudflare until the admin resets their password, or they log in once on the local app.
 
 ## Setup (once per Supabase project)
 
