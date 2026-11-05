@@ -139,6 +139,7 @@ const ICONS = {
   reviews: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   removals: '<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13M10 11v6M14 11v6"/>',
   my: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/>',
+  'pdf-tools': '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 12h6M9 16h6"/><path d="M12 9.5v9" stroke-dasharray="2 2"/>',
 };
 const icon = name => `<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ''}</svg>`;
 
@@ -148,9 +149,10 @@ function navFor(role) {
     ['#/dashboard', 'Dashboard', 'Home'], ['#/customers', 'Customers', 'Customers'], ['#/staff', 'Staff', 'Staff'],
     ['#/checklists', 'Checklists', 'Checklists', state.counts.checklist_requests],
     ['#/reviews', 'Review Queue', 'Review', state.counts.in_review], ['#/removals', 'Removal Requests', 'Removals', state.counts.removals],
+    ['#/pdf-tools', 'PDF Tools', 'PDF'],
   ];
-  if (role === 'staff') return [['#/dashboard', 'Dashboard', 'Home'], ['#/customers', 'Customers', 'Customers']];
-  return [['#/my', 'My Application', 'My Application']];
+  if (role === 'staff') return [['#/dashboard', 'Dashboard', 'Home'], ['#/customers', 'Customers', 'Customers'], ['#/pdf-tools', 'PDF Tools', 'PDF Tools']];
+  return [['#/my', 'My Application', 'Application'], ['#/pdf-tools', 'PDF Tools', 'PDF Tools']];
 }
 function shell(content) {
   const me = state.me;
@@ -296,6 +298,7 @@ async function route() {
   const home = { admin: 'dashboard', staff: 'dashboard', customer: 'my' }[role];
   try {
     await refreshCounts();
+    if (page === 'pdf-tools') return renderPdfTools();
     if (role === 'customer') return renderMy();
     switch (page) {
       case 'dashboard': return renderDashboard();
@@ -1541,6 +1544,356 @@ function smartUpload(customer, startItems, files, reload) {
         finish();
       })();
       $('#su-done').onclick = () => { close(); reload(); };
+    },
+  });
+}
+
+// -------------------------------------------------------------- PDF tools --
+// Everything runs in the browser (pdf-lib + pdf.js): files never leave the device until you upload them.
+const LIBS = {
+  pdfLib: { url: 'https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js', global: 'PDFLib' },
+  jszip: { url: 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js', global: 'JSZip' },
+};
+const libPromises = {};
+function loadLib(name) {
+  const { url, global } = LIBS[name];
+  libPromises[name] = libPromises[name] || new Promise((resolve, reject) => {
+    if (window[global]) return resolve(window[global]);
+    const s = document.createElement('script');
+    s.src = url;
+    s.onload = () => resolve(window[global]);
+    s.onerror = () => { delete libPromises[name]; reject(new Error('Could not load the PDF tools. Check your internet connection.')); };
+    document.head.appendChild(s);
+  });
+  return libPromises[name];
+}
+
+const PDF_TOOLS = {
+  img2pdf: { title: 'Image to PDF', icon: '🖼️', desc: 'Turn photos or scans into one PDF', accept: 'image/jpeg,image/png,image/webp', multiple: true, action: 'Create PDF' },
+  merge: { title: 'Merge PDF', icon: '🧩', desc: 'Combine several PDFs into one, in your order', accept: 'application/pdf,.pdf', multiple: true, action: 'Merge PDFs' },
+  split: { title: 'Split PDF', icon: '✂️', desc: 'Take out pages, or save every page separately', accept: 'application/pdf,.pdf', multiple: false, action: 'Split PDF' },
+  pdf2img: { title: 'PDF to Image', icon: '📷', desc: 'Save every page as a JPG or PNG picture', accept: 'application/pdf,.pdf', multiple: false, action: 'Convert to images' },
+};
+
+function renderPdfTools() {
+  const main = shell(`<div class="page-head"><div><h1>PDF Tools</h1>
+      <div class="muted">Free and private: files are processed on this device and only uploaded if you choose to.</div></div></div>
+    <div class="tool-grid">${Object.entries(PDF_TOOLS).map(([k, t]) => `<button class="tool-card" data-tool="${k}">
+      <span class="ic">${t.icon}</span><b>${t.title}</b><span>${t.desc}</span></button>`).join('')}</div>
+    <div class="card small muted" style="margin-top:16px">Tip: use <b>Image to PDF</b> to turn several photos of a bank statement into one PDF, then upload it straight into the checklist.</div>`);
+  main.querySelectorAll('[data-tool]').forEach(b => b.onclick = () => pdfToolModal(b.dataset.tool));
+}
+
+const baseName = n => n.replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_').slice(0, 60) || 'document';
+const fmtSize = b => (b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`);
+function downloadFile(file) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(file);
+  a.download = file.name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+}
+async function openPdf(file) {
+  const pdfjs = await withTimeout(loadPdfJs(), 20000, 'Loading the PDF reader');
+  try {
+    return await withTimeout(pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), standardFontDataUrl: `${PDFJS}/standard_fonts/` }).promise, 30000, 'Opening the PDF');
+  } catch (e) {
+    throw new Error(/password/i.test(e.name + e.message) ? `"${file.name}" is password-protected` : `"${file.name}" is not a readable PDF`);
+  }
+}
+// one PDF page → canvas at the given width (print intent: no requestAnimationFrame needed)
+async function renderPdfPage(pdf, n, width) {
+  const page = await pdf.getPage(n);
+  const base = page.getViewport({ scale: 1 });
+  const vp = page.getViewport({ scale: width / base.width });
+  const c = document.createElement('canvas');
+  c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: g, viewport: vp, intent: 'print' }).promise;
+  return c;
+}
+const canvasToBlob = (c, type, q) => new Promise(r => c.toBlob(r, type, q));
+// photos → JPEG bytes (white background for transparent PNGs), capped so PDFs stay small
+async function imageToJpeg(file, max = 2200) {
+  const bmp = await createImageBitmap(file);
+  const s = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * s); c.height = Math.round(bmp.height * s);
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  g.drawImage(bmp, 0, 0, c.width, c.height);
+  return { bytes: new Uint8Array(await (await canvasToBlob(c, 'image/jpeg', 0.85)).arrayBuffer()), w: c.width, h: c.height };
+}
+// "1-3, 5, 7-9" → [[0,1,2],[4],[6,7,8]] (zero-based page indexes)
+function parseRanges(text, pages) {
+  const groups = [];
+  for (const part of text.split(',').map(s => s.trim()).filter(Boolean)) {
+    const m = part.match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (!m) throw new Error(`"${part}" is not a page or range (use e.g. 1-3, 5)`);
+    const a = +m[1], b = m[2] ? +m[2] : a;
+    if (a < 1 || b > pages || a > b) throw new Error(`"${part}" is outside pages 1–${pages}`);
+    groups.push(Array.from({ length: b - a + 1 }, (_, i) => a - 1 + i));
+  }
+  if (!groups.length) throw new Error('Type the pages, e.g. 1-3, 5');
+  return groups;
+}
+
+const PDF_RUN = {
+  async img2pdf(files, opt, status) {
+    const { PDFDocument } = await loadLib('pdfLib');
+    const doc = await PDFDocument.create();
+    for (const [i, f] of files.entries()) {
+      status(`Adding image ${i + 1} of ${files.length}…`);
+      const { bytes, w, h } = await imageToJpeg(f.file);
+      const img = await doc.embedJpg(bytes);
+      const land = w > h;
+      const [pw, ph] = opt.size === 'fit' ? [w * 72 / 150, h * 72 / 150] : land ? [841.89, 595.28] : [595.28, 841.89];
+      const m = opt.size === 'fit' ? 0 : opt.margin === 'none' ? 0 : 28;
+      const sc = Math.min((pw - 2 * m) / w, (ph - 2 * m) / h);
+      const page = doc.addPage([pw, ph]);
+      page.drawImage(img, { x: (pw - w * sc) / 2, y: (ph - h * sc) / 2, width: w * sc, height: h * sc });
+    }
+    status('Saving PDF…');
+    return [new File([await doc.save()], `${baseName(files[0].file.name)}${files.length > 1 ? '-combined' : ''}.pdf`, { type: 'application/pdf' })];
+  },
+  async merge(files, opt, status) {
+    const { PDFDocument } = await loadLib('pdfLib');
+    const out = await PDFDocument.create();
+    for (const [i, f] of files.entries()) {
+      status(`Adding "${f.file.name}" (${i + 1} of ${files.length})…`);
+      let src;
+      try { src = await PDFDocument.load(await f.file.arrayBuffer()); } catch (e) {
+        throw new Error(/encrypt/i.test(e.message) ? `"${f.file.name}" is password-protected; unlock it first` : `"${f.file.name}" is not a readable PDF`);
+      }
+      (await out.copyPages(src, src.getPageIndices())).forEach(p => out.addPage(p));
+    }
+    status('Saving merged PDF…');
+    return [new File([await out.save()], `merged-${files.length}-files.pdf`, { type: 'application/pdf' })];
+  },
+  async split(files, opt, status) {
+    const { PDFDocument } = await loadLib('pdfLib');
+    const f = files[0];
+    let src;
+    try { src = await PDFDocument.load(await f.file.arrayBuffer()); } catch (e) {
+      throw new Error(/encrypt/i.test(e.message) ? `"${f.file.name}" is password-protected; unlock it first` : `"${f.file.name}" is not a readable PDF`);
+    }
+    const n = src.getPageCount();
+    let groups;
+    if (opt.mode === 'all') groups = Array.from({ length: n }, (_, i) => [i]);
+    else if (opt.mode === 'pick') {
+      if (!opt.picked.size) throw new Error('Tick the pages you want to keep');
+      groups = [[...opt.picked].sort((a, b) => a - b)];
+    } else groups = parseRanges(opt.ranges, n);
+    const out = [];
+    for (const [i, g] of groups.entries()) {
+      status(`Making file ${i + 1} of ${groups.length}…`);
+      const doc = await PDFDocument.create();
+      (await doc.copyPages(src, g)).forEach(p => doc.addPage(p));
+      const label = g.length === 1 ? `page-${g[0] + 1}` : `pages-${g[0] + 1}-${g[g.length - 1] + 1}`;
+      out.push(new File([await doc.save()], `${baseName(f.file.name)}-${opt.mode === 'pick' ? 'selected' : label}.pdf`, { type: 'application/pdf' }));
+    }
+    return out;
+  },
+  async pdf2img(files, opt, status) {
+    const f = files[0];
+    const pdf = await openPdf(f.file);
+    const type = opt.format === 'png' ? 'image/png' : 'image/jpeg';
+    const out = [];
+    for (let n = 1; n <= pdf.numPages; n++) {
+      status(`Converting page ${n} of ${pdf.numPages}…`);
+      const page = await pdf.getPage(n);
+      const width = Math.min(3000, page.getViewport({ scale: +opt.dpi / 72 }).width);
+      const c = await renderPdfPage(pdf, n, width);
+      out.push(new File([await canvasToBlob(c, type, 0.9)], `${baseName(f.file.name)}-page-${n}.${opt.format}`, { type }));
+    }
+    return out;
+  },
+};
+
+function pdfToolModal(key) {
+  const tool = PDF_TOOLS[key];
+  const files = []; // { file, thumb, pages }
+  const opt = { size: 'a4', margin: 'small', mode: 'all', ranges: '', picked: new Set(), format: 'jpg', dpi: '150' };
+  let results = [], splitPdf = null;
+  modal({
+    title: `${tool.icon} ${tool.title}`, wide: true,
+    body: `<label class="drop" id="pt-drop"><input type="file" hidden id="pt-in" accept="${tool.accept}" ${tool.multiple ? 'multiple' : ''}>
+        <span class="ic">${tool.icon}</span><b>${tool.multiple ? 'Select files' : 'Select a PDF'}</b>
+        <span class="small muted">${key === 'img2pdf' ? 'JPG, PNG or WEBP photos' : 'PDF file'}${tool.multiple ? ' · you can select many at once' : ''}</span></label>
+      <div class="pt-files" id="pt-files"></div>
+      <div id="pt-opts"></div>
+      <div class="pt-status" id="pt-status" hidden></div>
+      <div id="pt-out"></div>`,
+    foot: `<button data-close>Close</button><button class="btn-primary" id="pt-go" disabled>${tool.action}</button>`,
+    onMount: (el) => {
+      const $ = s => el.querySelector(s);
+      const status = (msg, cls = '') => { const s = $('#pt-status'); s.hidden = !msg; s.className = `pt-status ${cls}`; s.innerHTML = msg; };
+      const ready = () => {
+        const ok = tool.multiple ? files.length >= (key === 'merge' ? 2 : 1) : files.length === 1;
+        $('#pt-go').disabled = !ok;
+        if (key === 'merge' && files.length === 1) status('Add at least 2 PDFs to merge.');
+      };
+      const drawFiles = () => {
+        $('#pt-files').innerHTML = files.map((f, i) => `<div class="pt-file">
+            ${f.thumb ? `<img src="${f.thumb}" alt="">` : '<span class="pt-ph">PDF</span>'}
+            <div class="pt-fn"><div class="nm">${esc(f.file.name)}</div><div class="small muted">${fmtSize(f.file.size)}${f.pages ? ` · ${f.pages} page${f.pages > 1 ? 's' : ''}` : ''}</div></div>
+            ${tool.multiple ? `<button class="btn-sm" data-up="${i}" ${i ? '' : 'disabled'} title="Move up">↑</button><button class="btn-sm" data-dn="${i}" ${i < files.length - 1 ? '' : 'disabled'} title="Move down">↓</button>` : ''}
+            <button class="btn-sm btn-red" data-rm="${i}" title="Remove">✕</button></div>`).join('');
+        el.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { const i = +b.dataset.up; [files[i - 1], files[i]] = [files[i], files[i - 1]]; drawFiles(); });
+        el.querySelectorAll('[data-dn]').forEach(b => b.onclick = () => { const i = +b.dataset.dn; [files[i + 1], files[i]] = [files[i], files[i + 1]]; drawFiles(); });
+        el.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { files.splice(+b.dataset.rm, 1); splitPdf = null; drawFiles(); drawOpts(); });
+        $('#pt-drop').hidden = !tool.multiple && files.length > 0;
+        if (tool.multiple && files.length) $('#pt-drop').querySelector('b').textContent = 'Add more files';
+        ready();
+      };
+      const drawOpts = () => {
+        const o = $('#pt-opts');
+        if (key === 'img2pdf') {
+          o.innerHTML = `<div class="pt-opt"><label>Page size</label><div class="seg">
+              <label><input type="radio" name="pt-size" value="a4" ${opt.size === 'a4' ? 'checked' : ''}> A4 (best for upload)</label>
+              <label><input type="radio" name="pt-size" value="fit" ${opt.size === 'fit' ? 'checked' : ''}> Same as image</label></div></div>
+            <div class="pt-opt" ${opt.size === 'fit' ? 'hidden' : ''}><label>Margin</label><div class="seg">
+              <label><input type="radio" name="pt-margin" value="small" ${opt.margin === 'small' ? 'checked' : ''}> Small</label>
+              <label><input type="radio" name="pt-margin" value="none" ${opt.margin === 'none' ? 'checked' : ''}> None</label></div></div>`;
+        } else if (key === 'split' && files.length) {
+          o.innerHTML = `<div class="pt-opt"><label>How to split</label><div class="seg">
+              <label><input type="radio" name="pt-mode" value="all" ${opt.mode === 'all' ? 'checked' : ''}> Every page a separate PDF</label>
+              <label><input type="radio" name="pt-mode" value="pick" ${opt.mode === 'pick' ? 'checked' : ''}> Choose pages → one PDF</label>
+              <label><input type="radio" name="pt-mode" value="ranges" ${opt.mode === 'ranges' ? 'checked' : ''}> Page ranges</label></div></div>
+            ${opt.mode === 'ranges' ? `<div class="pt-opt"><label>Pages (one PDF per range)</label><input id="pt-ranges" placeholder="e.g. 1-3, 5, 7-9" value="${esc(opt.ranges)}"></div>` : ''}
+            ${opt.mode === 'pick' ? '<div class="small muted" style="margin-bottom:6px">Tap pages to select them</div><div class="pt-pages" id="pt-pages"><div class="small muted">Loading pages…</div></div>' : ''}`;
+          const r = $('#pt-ranges'); if (r) r.oninput = () => { opt.ranges = r.value; };
+          if (opt.mode === 'pick') drawPages();
+        } else if (key === 'pdf2img' && files.length) {
+          o.innerHTML = `<div class="pt-opt"><label>Format</label><div class="seg">
+              <label><input type="radio" name="pt-format" value="jpg" ${opt.format === 'jpg' ? 'checked' : ''}> JPG (smaller)</label>
+              <label><input type="radio" name="pt-format" value="png" ${opt.format === 'png' ? 'checked' : ''}> PNG (sharper)</label></div></div>
+            <div class="pt-opt"><label>Quality</label><div class="seg">
+              <label><input type="radio" name="pt-dpi" value="150" ${opt.dpi === '150' ? 'checked' : ''}> Normal</label>
+              <label><input type="radio" name="pt-dpi" value="220" ${opt.dpi === '220' ? 'checked' : ''}> High</label></div></div>`;
+        } else o.innerHTML = '';
+        o.querySelectorAll('input[type=radio]').forEach(r => r.onchange = () => { opt[r.name.slice(3)] = r.value; drawOpts(); });
+      };
+      const drawPages = async () => {
+        try {
+          splitPdf = splitPdf || await openPdf(files[0].file);
+          const box = $('#pt-pages');
+          box.innerHTML = '';
+          for (let n = 1; n <= Math.min(splitPdf.numPages, 80); n++) {
+            const c = await renderPdfPage(splitPdf, n, 110);
+            const cell = document.createElement('button');
+            cell.type = 'button';
+            cell.className = 'pt-page' + (opt.picked.has(n - 1) ? ' on' : '');
+            cell.appendChild(c);
+            cell.insertAdjacentHTML('beforeend', `<span>${n}</span>`);
+            cell.onclick = () => { opt.picked.has(n - 1) ? opt.picked.delete(n - 1) : opt.picked.add(n - 1); cell.classList.toggle('on'); };
+            if (!$('#pt-pages')) return; // dialog closed or mode changed
+            box.appendChild(cell);
+          }
+        } catch (e) { status(`✕ ${esc(e.message)}`, 'err'); }
+      };
+      const addFiles = async list => {
+        status('');
+        for (const file of list) {
+          if (!tool.multiple && files.length) files.length = 0;
+          const isPdf = /\.pdf$/i.test(file.name) || file.type === 'application/pdf';
+          if (key === 'img2pdf' ? !/^image\/(jpeg|png|webp)$/.test(file.type) : !isPdf) { status(`✕ "${esc(file.name)}" is not a ${key === 'img2pdf' ? 'JPG/PNG/WEBP image' : 'PDF'}`, 'err'); continue; }
+          const f = { file };
+          files.push(f);
+          drawFiles();
+          try {
+            if (isPdf) { const pdf = await openPdf(file); f.pages = pdf.numPages; f.thumb = (await renderPdfPage(pdf, 1, 90)).toDataURL('image/jpeg', 0.7); }
+            else f.thumb = URL.createObjectURL(file);
+          } catch (e) { status(`⚠ ${esc(e.message)}`, 'err'); }
+          drawFiles();
+        }
+        splitPdf = null; opt.picked.clear();
+        drawOpts();
+      };
+      $('#pt-in').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+      drawOpts(); drawFiles();
+
+      $('#pt-go').onclick = async () => {
+        $('#pt-go').disabled = true;
+        $('#pt-out').innerHTML = '';
+        const t = performance.now();
+        try {
+          results = await PDF_RUN[key](files, opt, msg => status(`<span class="spin"></span> ${esc(msg)}`));
+          const total = results.reduce((s, f) => s + f.size, 0);
+          status(`✓ Done in ${((performance.now() - t) / 1000).toFixed(1)}s · ${results.length} file${results.length > 1 ? 's' : ''} · ${fmtSize(total)}`, 'ok');
+          drawResults();
+        } catch (e) {
+          status(`✕ ${esc(e.message)}`, 'err');
+        }
+        $('#pt-go').disabled = false;
+      };
+
+      const drawResults = () => {
+        $('#pt-out').innerHTML = `<div class="pt-res">
+          ${results.length > 1 ? `<div class="pt-res-head"><b>${results.length} files ready</b><button class="btn-primary btn-sm" id="pt-zip">⬇ Download all (ZIP)</button></div>` : ''}
+          ${results.map((f, i) => `<div class="pt-file"><span class="pt-ph">${/pdf$/i.test(f.name) ? 'PDF' : f.name.split('.').pop().toUpperCase()}</span>
+            <div class="pt-fn"><div class="nm">${esc(f.name)}</div><div class="small muted">${fmtSize(f.size)}${f.size > 10 * 1048576 ? ' · <span style="color:var(--red)">over the 10 MB upload limit</span>' : ''}</div></div>
+            <button class="btn-sm" data-dl="${i}">⬇ Download</button>
+            ${f.size <= 10 * 1048576 ? `<button class="btn-sm btn-primary" data-ck="${i}">Upload to checklist</button>` : ''}</div>
+            <div class="pt-ck" id="pt-ck-${i}" hidden></div>`).join('')}</div>`;
+        el.querySelectorAll('[data-dl]').forEach(b => b.onclick = () => downloadFile(results[+b.dataset.dl]));
+        el.querySelectorAll('[data-ck]').forEach(b => b.onclick = () => checklistPicker(+b.dataset.ck));
+        const zip = $('#pt-zip');
+        if (zip) zip.onclick = async () => {
+          zip.disabled = true; zip.textContent = 'Zipping…';
+          try {
+            const JSZip = await loadLib('jszip');
+            const z = new JSZip();
+            results.forEach(f => z.file(f.name, f));
+            downloadFile(new File([await z.generateAsync({ type: 'blob' })], `${tool.title.toLowerCase().replace(/\s+/g, '-')}-${results.length}-files.zip`, { type: 'application/zip' }));
+          } catch (e) { toast(e.message, true); }
+          zip.disabled = false; zip.textContent = '⬇ Download all (ZIP)';
+        };
+      };
+
+      // send one result into a customer's checklist item
+      const checklistPicker = async i => {
+        const box = $(`#pt-ck-${i}`);
+        box.hidden = false;
+        box.innerHTML = '<div class="small muted">Loading…</div>';
+        const isCustomer = state.me.role === 'customer';
+        const loadItems = async cid => (await api('GET', `/api/customers/${cid}`)).items.filter(fillable);
+        const itemSel = list => list.length ? `<select id="pt-it-${i}">${list.map(it => `<option value="${it.id}">${esc(it.name)}${it.status === 'rejected' ? ' (re-upload)' : ''}</option>`).join('')}</select>`
+          : '<span class="small muted">No checklist item is waiting for a document.</span>';
+        try {
+          if (isCustomer) {
+            box.innerHTML = `<div class="toolbar">${itemSel(await loadItems(state.me.id))}<button class="btn-sm btn-primary" id="pt-send-${i}">Upload</button></div>`;
+          } else {
+            const { users } = await api('GET', '/api/users?role=customer');
+            box.innerHTML = `<div class="toolbar"><select id="pt-cu-${i}"><option value="">Choose customer…</option>
+              ${users.map(u => `<option value="${u.id}">${esc(u.full_name)}${u.passport_no ? ` · ${esc(u.passport_no)}` : ''}</option>`).join('')}</select>
+              <span id="pt-its-${i}"></span><button class="btn-sm btn-primary" id="pt-send-${i}" disabled>Upload</button></div>`;
+            $(`#pt-cu-${i}`).onchange = async e => {
+              const cid = e.target.value;
+              $(`#pt-send-${i}`).disabled = true;
+              $(`#pt-its-${i}`).innerHTML = cid ? '<span class="small muted">Loading…</span>' : '';
+              if (!cid) return;
+              const list = await loadItems(cid);
+              $(`#pt-its-${i}`).innerHTML = itemSel(list);
+              $(`#pt-send-${i}`).disabled = !list.length;
+            };
+          }
+          const send = $(`#pt-send-${i}`);
+          send.onclick = async () => {
+            const sel = $(`#pt-it-${i}`);
+            if (!sel) return;
+            send.disabled = true; send.textContent = 'Uploading…';
+            const fd = new FormData();
+            fd.append('file', results[i]);
+            try {
+              await api('POST', `/api/items/${sel.value}/upload`, fd);
+              box.innerHTML = `<div class="hint ok">✓ Uploaded to <b>${esc(sel.selectedOptions[0].textContent)}</b> · now In review</div>`;
+            } catch (e) { toast(e.message, true); send.disabled = false; send.textContent = 'Upload'; }
+          };
+        } catch (e) { box.innerHTML = `<div class="hint warn">${esc(e.message)}</div>`; }
+      };
     },
   });
 }

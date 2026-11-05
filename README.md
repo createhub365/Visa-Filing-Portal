@@ -45,6 +45,12 @@ Live: https://visa-filing-portal.createhub365.workers.dev
   customer, the file is uploaded into the matching checklist item, and documents the checklist did not ask for get a
   new custom item. Name mismatches and unreadable files wait for a decision. PDFs are read from page 1 (pdf.js, cdnjs).
 
+## PDF Tools (menu → PDF Tools; all roles)
+
+Image to PDF, Merge PDF, Split PDF (every page / chosen pages / ranges) and PDF to Image (JPG/PNG, ZIP download).
+They run entirely in the browser with pdf-lib, pdf.js and JSZip (loaded from cdnjs), so files are not uploaded unless
+the user presses **Upload to checklist** on a result. PDF ↔ Word conversion is not included (needs a server-side service).
+
 ## Document flow
 
 `Pending` → upload → `In Review` → admin **Accept** → `Accepted`
