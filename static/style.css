@@ -15,7 +15,9 @@ h1 { font-size: 22px; } h2 { font-size: 18px; } h3 { font-size: 15px; }
 
 /* layout */
 .shell { display: flex; min-height: 100vh; }
-.sidebar { width: 230px; background: #0f1d40; color: #c9d3ec; padding: 20px 14px; flex-shrink: 0; display: flex; flex-direction: column; }
+/* sticky: the menu stays in view while long pages scroll; scrolls on its own if the window is very short */
+.sidebar { width: 230px; background: #0f1d40; color: #c9d3ec; padding: 20px 14px; flex-shrink: 0; display: flex; flex-direction: column;
+  position: sticky; top: 0; height: 100vh; height: 100dvh; align-self: flex-start; overflow-y: auto; }
 .brand { color: #fff; font-weight: 700; font-size: 16px; padding: 0 8px 18px; display: flex; gap: 8px; align-items: center; }
 .brand .logo { width: 30px; height: 30px; border-radius: 8px; background: var(--primary); display: grid; place-items: center; font-size: 15px; }
 .nav a { display: flex; justify-content: space-between; align-items: center; color: #c9d3ec; padding: 9px 10px; border-radius: 8px; margin-bottom: 2px; }
