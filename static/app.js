@@ -1669,6 +1669,29 @@ async function addImagePage(doc, file, opt = {}) {
   doc.addPage([pw, ph]).drawImage(img, { x: (pw - w * sc) / 2, y: (ph - h * sc) / 2, width: w * sc, height: h * sc });
 }
 
+// Usual order of a visa file; documents are matched by name, ties keep their current order
+const VISA_FILE_ORDER = [
+  /photo|photograph/,
+  /passport/,
+  /application form|visa form|\bform\b(?!.*16)/,
+  /cover letter|covering letter/,
+  /aadhaar|aadhar|pan card|\bpan\b|national id|voter|driving|identity/,
+  /resume|\bcv\b|curriculum/,
+  /offer|appointment|employment|experience|\bnoc\b|leave|employee|job/,
+  /10th|12th|secondary|degree|diploma|academic|marksheet|mark sheet|certificate|transcript|ielts|toefl|pte|education/,
+  /salary|form 16|itr|income tax|bank|balance|fixed deposit|property|gst|company|business|partnership|udyam|sponsor|financ|fund/,
+  /flight|ticket|hotel|itinerary|insurance|invitation|booking/,
+];
+function smartOrder(list, label) {
+  const rank = f => {
+    const n = normText(label(f));
+    if (/passport/.test(n) && !/size|photo/.test(n)) return 0; // the passport itself comes first
+    const i = VISA_FILE_ORDER.findIndex(re => re.test(n));
+    return i < 0 ? VISA_FILE_ORDER.length : i + 1;
+  };
+  return list.map((f, i) => ({ f, i, r: rank(f) })).sort((a, b) => a.r - b.r || a.i - b.i).map(x => x.f);
+}
+
 const PDF_RUN = {
   async img2pdf(files, opt, status) {
     const { PDFDocument } = await loadLib('pdfLib');
@@ -1764,17 +1787,85 @@ function pdfToolModal(key, preset = null) {
         $('#pt-go').disabled = !ok;
         if (key === 'merge' && !preset && files.length === 1) status('Add at least 2 files to merge.');
       };
+      // ---- file list with fast reordering: drag the ⋮⋮ handle, tap-to-order, smart order, A→Z, reverse
+      let tapOrder = null; // array of file objects while "Tap to order" is on
+      const fileLabel = f => (f.source ? f.source.itemName : f.file.name);
       const drawFiles = () => {
-        $('#pt-files').innerHTML = files.map((f, i) => `<div class="pt-file">
+        const many = tool.multiple && files.length > 1;
+        const tapping = Array.isArray(tapOrder);
+        $('#pt-files').innerHTML = (many ? `<div class="pt-arrange">
+            ${tapping ? `<span class="pt-tapnote">Tap the documents in the order you want · <b>${tapOrder.length} of ${files.length}</b></span>
+                <button class="btn-sm btn-primary" data-arr="tapdone">Done</button><button class="btn-sm" data-arr="tapcancel">Cancel</button>`
+              : `<span class="small muted">Arrange:</span>
+                <button class="btn-sm" data-arr="tap" title="Tap the documents in the order you want">🔢 Tap to order</button>
+                <button class="btn-sm" data-arr="smart" title="Passport, photo, forms, ID, CV, job letters, education, financial, travel">✨ Smart order</button>
+                <button class="btn-sm" data-arr="az">A→Z</button><button class="btn-sm" data-arr="rev">⇅ Reverse</button>`}
+          </div>` : '')
+          + files.map((f, i) => {
+            const n = tapping ? tapOrder.indexOf(f) + 1 : 0;
+            return `<div class="pt-file${tapping ? ' tappable' : ''}${n ? ' tapped' : ''}" data-i="${i}">
+            ${many && !tapping ? '<span class="pt-grip" title="Drag to move">⋮⋮</span>' : ''}
+            ${tapping ? `<span class="pt-num">${n || ''}</span>` : ''}
             ${f.thumb ? `<img src="${f.thumb}" alt="">` : '<span class="pt-ph">PDF</span>'}
-            <div class="pt-fn"><div class="nm">${esc(f.source ? f.source.itemName : f.file.name)}</div><div class="small muted">${f.source ? `📂 ${esc(f.source.customerName)} · ` : ''}${fmtSize(f.file.size)}${f.pages ? ` · ${f.pages} page${f.pages > 1 ? 's' : ''}` : ''}</div></div>
-            ${tool.multiple ? `<button class="btn-sm" data-up="${i}" ${i ? '' : 'disabled'} title="Move up">↑</button><button class="btn-sm" data-dn="${i}" ${i < files.length - 1 ? '' : 'disabled'} title="Move down">↓</button>` : ''}
-            <button class="btn-sm btn-red" data-rm="${i}" title="Remove">✕</button></div>`).join('');
+            <div class="pt-fn"><div class="nm">${esc(fileLabel(f))}</div><div class="small muted">${f.source ? `📂 ${esc(f.source.customerName)} · ` : ''}${fmtSize(f.file.size)}${f.pages ? ` · ${f.pages} page${f.pages > 1 ? 's' : ''}` : ''}</div></div>
+            ${many && !tapping ? `<button class="btn-sm pt-step" data-up="${i}" ${i ? '' : 'disabled'} title="Move up">↑</button><button class="btn-sm pt-step" data-dn="${i}" ${i < files.length - 1 ? '' : 'disabled'} title="Move down">↓</button>` : ''}
+            ${tapping ? '' : `<button class="btn-sm btn-red" data-rm="${i}" title="Remove">✕</button>`}</div>`;
+          }).join('');
         el.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { const i = +b.dataset.up; [files[i - 1], files[i]] = [files[i], files[i - 1]]; drawFiles(); });
         el.querySelectorAll('[data-dn]').forEach(b => b.onclick = () => { const i = +b.dataset.dn; [files[i + 1], files[i]] = [files[i], files[i + 1]]; drawFiles(); });
         el.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { files.splice(+b.dataset.rm, 1); splitPdf = null; drawFiles(); drawOpts(); });
+        el.querySelectorAll('[data-arr]').forEach(b => b.onclick = () => arrange(b.dataset.arr));
+        if (tapping) {
+          el.querySelectorAll('.pt-file.tappable').forEach(row => row.onclick = () => {
+            const f = files[+row.dataset.i];
+            const at = tapOrder.indexOf(f);
+            if (at >= 0) tapOrder.splice(at, 1); else tapOrder.push(f);
+            if (tapOrder.length === files.length) return arrange('tapdone'); // everything numbered: apply at once
+            drawFiles();
+          });
+        }
+        el.querySelectorAll('.pt-grip').forEach(bindDrag);
         $('#pt-drop').hidden = !tool.multiple && files.length > 0;
         ready();
+      };
+      const setOrder = list => { files.splice(0, files.length, ...list); drawFiles(); };
+      const arrange = how => {
+        if (how === 'tap') { tapOrder = []; return drawFiles(); }
+        if (how === 'tapcancel') { tapOrder = null; return drawFiles(); }
+        if (how === 'tapdone') {
+          const chosen = tapOrder || [];
+          tapOrder = null;
+          if (chosen.length) toast(`Order set${chosen.length < files.length ? ` · ${files.length - chosen.length} untapped kept at the end` : ''}`);
+          return setOrder([...chosen, ...files.filter(f => !chosen.includes(f))]);
+        }
+        if (how === 'smart') { setOrder(smartOrder(files, fileLabel)); return toast('Arranged in visa-file order'); }
+        if (how === 'az') return setOrder([...files].sort((a, b) => fileLabel(a).localeCompare(fileLabel(b))));
+        if (how === 'rev') return setOrder([...files].reverse());
+      };
+      // drag a row by its ⋮⋮ handle (pointer events: mouse, touch and pen)
+      const bindDrag = grip => grip.onpointerdown = e => {
+        e.preventDefault();
+        const list = $('#pt-files'), row = grip.closest('.pt-file'), scroller = el.querySelector('.modal-body');
+        try { grip.setPointerCapture(e.pointerId); } catch { /* not supported: moves still reach the handle */ }
+        row.classList.add('dragging');
+        let lastY = e.clientY, raf = 0;
+        const place = () => {
+          const rows = [...list.querySelectorAll('.pt-file:not(.dragging)')];
+          const after = rows.find(r => { const b = r.getBoundingClientRect(); return lastY < b.top + b.height / 2; });
+          if (after !== row.nextElementSibling) list.insertBefore(row, after || null);
+          const box = scroller.getBoundingClientRect(); // scroll while dragging near the edge
+          if (lastY < box.top + 50) scroller.scrollTop -= 12; else if (lastY > box.bottom - 50) scroller.scrollTop += 12;
+          raf = 0;
+        };
+        const move = ev => { lastY = ev.clientY; raf = raf || requestAnimationFrame(place); };
+        const up = () => {
+          grip.removeEventListener('pointermove', move);
+          row.classList.remove('dragging');
+          setOrder([...list.querySelectorAll('.pt-file')].map(r => files[+r.dataset.i]));
+        };
+        grip.addEventListener('pointermove', move);
+        grip.addEventListener('pointerup', up, { once: true });
+        grip.addEventListener('pointercancel', up, { once: true });
       };
       const drawOpts = () => {
         const o = $('#pt-opts');

@@ -254,6 +254,16 @@ tr.click { cursor: pointer; } tr.click:hover td { background: #f8f9fc; }
 .tool-card .ic { font-size: 30px; }
 .tool-card b { font-size: 16px; }
 .tool-card span:not(.ic) { color: var(--muted); font-size: 13px; }
+.pt-arrange { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 8px 10px; border-radius: 10px; background: #f4f6fb; }
+.pt-tapnote { flex: 1; min-width: 180px; font-size: 13px; color: #3d2a6e; }
+.pt-grip { cursor: grab; touch-action: none; user-select: none; color: #9aa3b8; font-size: 18px; letter-spacing: -3px; padding: 6px 6px 6px 2px; line-height: 1; }
+.pt-grip:active { cursor: grabbing; }
+.pt-file.dragging { opacity: .9; border-color: var(--primary); box-shadow: 0 8px 24px rgba(31,79,209,.25); transform: scale(1.01); position: relative; z-index: 2; }
+.pt-file.tappable { cursor: pointer; user-select: none; }
+.pt-file.tappable:hover { border-color: #b7c4e6; }
+.pt-file.tapped { border-color: var(--primary); background: var(--primary-soft); }
+.pt-num { width: 28px; height: 28px; border-radius: 50%; border: 2px dashed #b7c4e6; display: grid; place-items: center; font-weight: 700; flex-shrink: 0; }
+.pt-file.tapped .pt-num { background: var(--primary); border: 0; color: #fff; }
 .pt-src { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .pt-pick { border: 1px solid #c9d4f0; background: #f7f9ff; border-radius: 12px; padding: 12px; margin-top: 10px; }
 .pt-pick #pt-pick-docs { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
@@ -293,6 +303,10 @@ tr.click { cursor: pointer; } tr.click:hover td { background: #f8f9fc; }
   .tool-card { padding: 14px; }
   .pt-file { flex-wrap: wrap; }
   .pt-file .btn-sm { flex: 1; justify-content: center; }
+  .pt-files .pt-file { flex-wrap: nowrap; }
+  .pt-files .pt-file .btn-sm { flex: 0 0 auto; }
+  .pt-files .pt-step { display: none; } /* on phones: drag or tap to order */
+  .pt-grip { font-size: 22px; padding: 8px 8px 8px 2px; }
 }
 
 .empty-cl { text-align: center; padding: 30px 16px; border: 2px dashed var(--line); border-radius: var(--radius); }
