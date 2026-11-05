@@ -51,6 +51,11 @@ Image to PDF, Merge PDF, Split PDF (every page / chosen pages / ranges) and PDF 
 They run entirely in the browser with pdf-lib, pdf.js and JSZip (loaded from cdnjs), so files are not uploaded unless
 the user presses **Upload to checklist** on a result. PDF ↔ Word conversion is not included (needs a server-side service).
 
+- Each tool takes files **from the computer/phone** or **from the portal** (documents already in a customer's checklist).
+- Results go back into the checklist as: an empty/rejected item, a new custom item, or (admin only) **Replace original**,
+  which removes the old file and uploads the new one (it goes to In review).
+- Customer page: **Download all as one PDF** merges every uploaded document (PDFs and photos) in checklist order.
+
 ## Document flow
 
 `Pending` → upload → `In Review` → admin **Accept** → `Accepted`

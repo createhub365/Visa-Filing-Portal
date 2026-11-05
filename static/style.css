@@ -254,6 +254,17 @@ tr.click { cursor: pointer; } tr.click:hover td { background: #f8f9fc; }
 .tool-card .ic { font-size: 30px; }
 .tool-card b { font-size: 16px; }
 .tool-card span:not(.ic) { color: var(--muted); font-size: 13px; }
+.pt-src { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pt-pick { border: 1px solid #c9d4f0; background: #f7f9ff; border-radius: 12px; padding: 12px; margin-top: 10px; }
+.pt-pick #pt-pick-docs { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
+.pt-doc { display: flex; gap: 10px; align-items: center; font-weight: 400; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; margin: 0; cursor: pointer; }
+.pt-doc input { width: auto; }
+.pt-doc:has(input:checked) { border-color: var(--primary); background: var(--primary-soft); }
+.docs-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin: -4px 0 12px; padding: 8px 12px;
+  border: 1px solid var(--line); border-radius: 10px; background: #fafbfe; font-size: 13.5px; }
+.pt-ck .toolbar { align-items: center; }
+.pt-ck input { width: auto; flex: 1; min-width: 160px; padding: 5px 8px; }
+@media (max-width: 820px) { .pt-src { grid-template-columns: 1fr; } .docs-bar button { width: 100%; justify-content: center; } }
 .pt-files { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
 .pt-files:empty { display: none; }
 .pt-file { display: flex; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: #fff; }

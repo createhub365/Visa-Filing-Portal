@@ -927,7 +927,7 @@ async function renderCustomer(id) {
     ${profileCard(c, isAdmin)}
     <div class="card"><div class="page-head" style="margin-bottom:12px"><div><h2>Document checklist</h2><div style="margin-top:6px">${checklistSummary(data.progress)}</div></div>
       ${isAdmin ? `<div class="toolbar">${data.checklist_available && data.items.length ? '<button id="applycl">Apply checklist</button>' : ''}<button class="btn-primary" id="additem">+ Add document</button></div>` : ''}</div>
-      ${smartBar(false)}
+      ${smartBar(false)}${mergeAllBar(data.items)}
       <div class="checklist">${data.items.length ? data.items.map(it => docCard(it, role)).join('') : noChecklistBox(c, data, role)}</div></div>
     <div class="card"><h2 style="margin-bottom:8px">Activity</h2><ul class="activity">
       ${data.activity.map(a => `<li><b>${esc(a.action)}</b>${a.detail ? ` — ${esc(a.detail)}` : ''}<div class="small muted">${fmtDate(a.at)}${a.by_name ? ` · ${esc(a.by_name)} (${esc(a.by_role)})` : ''}</div></li>`).join('') || '<li class="muted">No activity yet.</li>'}
@@ -936,6 +936,7 @@ async function renderCustomer(id) {
   bindDocActions(main, data.items, reload);
   bindNoChecklist(main, c, reload);
   bindSmartUpload(main, c, data.items, reload);
+  bindMergeAll(main, c, data.items);
   if (!isAdmin) return;
   main.querySelector('#editc').onclick = () => userFormModal('customer', c);
   main.querySelector('#stage').onchange = async e => { await run(() => api('PUT', `/api/users/${id}`, { stage: e.target.value }), 'Stage updated'); reload(); };
@@ -970,12 +971,13 @@ async function renderMy() {
     <div class="card"><div class="page-head" style="margin-bottom:12px"><div><h2>Your document checklist</h2>
       <div class="small muted" style="margin-top:2px">${p.accepted} of ${p.total} documents accepted</div></div>${checklistSummary(p)}</div>
       <div style="margin-bottom:14px">${progressBar(p)}</div>
-      ${smartBar(true)}
+      ${smartBar(true)}${mergeAllBar(data.items)}
       <div class="checklist">${data.items.length ? data.items.map(it => docCard(it, 'customer')).join('') : noChecklistBox(c, data, 'customer')}</div>
       <p class="small muted" style="margin-bottom:0">Accepted formats: PDF, JPG, PNG, WEBP · max 10 MB. To remove an uploaded document, press Remove — the request goes to our admin for approval.</p></div>`);
   bindDocActions(main, data.items, renderMy);
   bindNoChecklist(main, c, renderMy);
   bindSmartUpload(main, c, data.items, renderMy);
+  bindMergeAll(main, c, data.items);
 }
 
 // ------------------------------------------------------------- checklists --
@@ -1548,6 +1550,22 @@ function smartUpload(customer, startItems, files, reload) {
   });
 }
 
+// ---------------------------------------------------- all documents → one PDF --
+function mergeAllBar(items) {
+  const n = items.filter(i => i.has_file).length;
+  return n ? `<div class="docs-bar"><span>📑 <b>${n}</b> document${n > 1 ? 's' : ''} uploaded</span>
+    <button class="btn-sm" data-mergeall>⬇ Download all as one PDF</button></div>` : '';
+}
+function bindMergeAll(root, customer, items) {
+  const b = root.querySelector('[data-mergeall]');
+  if (!b) return;
+  b.onclick = () => pdfToolModal('merge', {
+    customer: { id: customer.id, full_name: customer.full_name },
+    docs: items.filter(i => i.has_file), // checklist order
+    outName: `${baseName(customer.full_name)}-all-documents`,
+  });
+}
+
 // -------------------------------------------------------------- PDF tools --
 // Everything runs in the browser (pdf-lib + pdf.js): files never leave the device until you upload them.
 const LIBS = {
@@ -1570,7 +1588,7 @@ function loadLib(name) {
 
 const PDF_TOOLS = {
   img2pdf: { title: 'Image to PDF', icon: '🖼️', desc: 'Turn photos or scans into one PDF', accept: 'image/jpeg,image/png,image/webp', multiple: true, action: 'Create PDF' },
-  merge: { title: 'Merge PDF', icon: '🧩', desc: 'Combine several PDFs into one, in your order', accept: 'application/pdf,.pdf', multiple: true, action: 'Merge PDFs' },
+  merge: { title: 'Merge PDF', icon: '🧩', desc: 'Combine PDFs and photos into one PDF, in your order', accept: 'application/pdf,.pdf,image/jpeg,image/png,image/webp', multiple: true, action: 'Merge into one PDF' },
   split: { title: 'Split PDF', icon: '✂️', desc: 'Take out pages, or save every page separately', accept: 'application/pdf,.pdf', multiple: false, action: 'Split PDF' },
   pdf2img: { title: 'PDF to Image', icon: '📷', desc: 'Save every page as a JPG or PNG picture', accept: 'application/pdf,.pdf', multiple: false, action: 'Convert to images' },
 };
@@ -1640,29 +1658,34 @@ function parseRanges(text, pages) {
   return groups;
 }
 
+const isImageFile = f => /^image\/(jpeg|png|webp)$/.test(f.type);
+// add one photo to a pdf-lib document as its own page (A4 by default, landscape for wide photos)
+async function addImagePage(doc, file, opt = {}) {
+  const { bytes, w, h } = await imageToJpeg(file);
+  const img = await doc.embedJpg(bytes);
+  const [pw, ph] = opt.size === 'fit' ? [w * 72 / 150, h * 72 / 150] : w > h ? [841.89, 595.28] : [595.28, 841.89];
+  const m = opt.size === 'fit' || opt.margin === 'none' ? 0 : 28;
+  const sc = Math.min((pw - 2 * m) / w, (ph - 2 * m) / h);
+  doc.addPage([pw, ph]).drawImage(img, { x: (pw - w * sc) / 2, y: (ph - h * sc) / 2, width: w * sc, height: h * sc });
+}
+
 const PDF_RUN = {
   async img2pdf(files, opt, status) {
     const { PDFDocument } = await loadLib('pdfLib');
     const doc = await PDFDocument.create();
     for (const [i, f] of files.entries()) {
       status(`Adding image ${i + 1} of ${files.length}…`);
-      const { bytes, w, h } = await imageToJpeg(f.file);
-      const img = await doc.embedJpg(bytes);
-      const land = w > h;
-      const [pw, ph] = opt.size === 'fit' ? [w * 72 / 150, h * 72 / 150] : land ? [841.89, 595.28] : [595.28, 841.89];
-      const m = opt.size === 'fit' ? 0 : opt.margin === 'none' ? 0 : 28;
-      const sc = Math.min((pw - 2 * m) / w, (ph - 2 * m) / h);
-      const page = doc.addPage([pw, ph]);
-      page.drawImage(img, { x: (pw - w * sc) / 2, y: (ph - h * sc) / 2, width: w * sc, height: h * sc });
+      await addImagePage(doc, f.file, opt);
     }
     status('Saving PDF…');
-    return [new File([await doc.save()], `${baseName(files[0].file.name)}${files.length > 1 ? '-combined' : ''}.pdf`, { type: 'application/pdf' })];
+    return [new File([await doc.save()], `${opt.outName || baseName(files[0].file.name) + (files.length > 1 ? '-combined' : '')}.pdf`, { type: 'application/pdf' })];
   },
   async merge(files, opt, status) {
     const { PDFDocument } = await loadLib('pdfLib');
     const out = await PDFDocument.create();
     for (const [i, f] of files.entries()) {
       status(`Adding "${f.file.name}" (${i + 1} of ${files.length})…`);
+      if (isImageFile(f.file)) { await addImagePage(out, f.file); continue; }
       let src;
       try { src = await PDFDocument.load(await f.file.arrayBuffer()); } catch (e) {
         throw new Error(/encrypt/i.test(e.message) ? `"${f.file.name}" is password-protected; unlock it first` : `"${f.file.name}" is not a readable PDF`);
@@ -1670,7 +1693,7 @@ const PDF_RUN = {
       (await out.copyPages(src, src.getPageIndices())).forEach(p => out.addPage(p));
     }
     status('Saving merged PDF…');
-    return [new File([await out.save()], `merged-${files.length}-files.pdf`, { type: 'application/pdf' })];
+    return [new File([await out.save()], `${opt.outName || `merged-${files.length}-files`}.pdf`, { type: 'application/pdf' })];
   },
   async split(files, opt, status) {
     const { PDFDocument } = await loadLib('pdfLib');
@@ -1712,16 +1735,22 @@ const PDF_RUN = {
   },
 };
 
-function pdfToolModal(key) {
+// preset: { customer, docs, outName } opens the tool with those portal documents already loaded
+function pdfToolModal(key, preset = null) {
   const tool = PDF_TOOLS[key];
-  const files = []; // { file, thumb, pages }
-  const opt = { size: 'a4', margin: 'small', mode: 'all', ranges: '', picked: new Set(), format: 'jpg', dpi: '150' };
+  const files = []; // { file, thumb, pages, source? }  source: the portal checklist item the file came from
+  const opt = { size: 'a4', margin: 'small', mode: 'all', ranges: '', picked: new Set(), format: 'jpg', dpi: '150', outName: preset?.outName || '' };
+  const kinds = key === 'img2pdf' ? 'JPG, PNG or WEBP photos' : key === 'merge' ? 'PDFs and photos' : 'a PDF';
   let results = [], splitPdf = null;
   modal({
     title: `${tool.icon} ${tool.title}`, wide: true,
-    body: `<label class="drop" id="pt-drop"><input type="file" hidden id="pt-in" accept="${tool.accept}" ${tool.multiple ? 'multiple' : ''}>
-        <span class="ic">${tool.icon}</span><b>${tool.multiple ? 'Select files' : 'Select a PDF'}</b>
-        <span class="small muted">${key === 'img2pdf' ? 'JPG, PNG or WEBP photos' : 'PDF file'}${tool.multiple ? ' · you can select many at once' : ''}</span></label>
+    body: `<div class="pt-src" id="pt-drop">
+        <label class="drop"><input type="file" hidden id="pt-in" accept="${tool.accept}" ${tool.multiple ? 'multiple' : ''}>
+          <span class="ic">💻</span><b>From computer / phone</b><span class="small muted">${kinds}${tool.multiple ? ' · select many at once' : ''}</span></label>
+        <button type="button" class="drop" id="pt-portal"><span class="ic">📂</span><b>From portal</b>
+          <span class="small muted">Documents already uploaded to ${state.me.role === 'customer' ? 'your' : 'a customer’s'} checklist</span></button>
+      </div>
+      <div class="pt-pick" id="pt-pick" hidden></div>
       <div class="pt-files" id="pt-files"></div>
       <div id="pt-opts"></div>
       <div class="pt-status" id="pt-status" hidden></div>
@@ -1731,21 +1760,20 @@ function pdfToolModal(key) {
       const $ = s => el.querySelector(s);
       const status = (msg, cls = '') => { const s = $('#pt-status'); s.hidden = !msg; s.className = `pt-status ${cls}`; s.innerHTML = msg; };
       const ready = () => {
-        const ok = tool.multiple ? files.length >= (key === 'merge' ? 2 : 1) : files.length === 1;
+        const ok = tool.multiple ? files.length >= (key === 'merge' && !preset ? 2 : 1) : files.length === 1;
         $('#pt-go').disabled = !ok;
-        if (key === 'merge' && files.length === 1) status('Add at least 2 PDFs to merge.');
+        if (key === 'merge' && !preset && files.length === 1) status('Add at least 2 files to merge.');
       };
       const drawFiles = () => {
         $('#pt-files').innerHTML = files.map((f, i) => `<div class="pt-file">
             ${f.thumb ? `<img src="${f.thumb}" alt="">` : '<span class="pt-ph">PDF</span>'}
-            <div class="pt-fn"><div class="nm">${esc(f.file.name)}</div><div class="small muted">${fmtSize(f.file.size)}${f.pages ? ` · ${f.pages} page${f.pages > 1 ? 's' : ''}` : ''}</div></div>
+            <div class="pt-fn"><div class="nm">${esc(f.source ? f.source.itemName : f.file.name)}</div><div class="small muted">${f.source ? `📂 ${esc(f.source.customerName)} · ` : ''}${fmtSize(f.file.size)}${f.pages ? ` · ${f.pages} page${f.pages > 1 ? 's' : ''}` : ''}</div></div>
             ${tool.multiple ? `<button class="btn-sm" data-up="${i}" ${i ? '' : 'disabled'} title="Move up">↑</button><button class="btn-sm" data-dn="${i}" ${i < files.length - 1 ? '' : 'disabled'} title="Move down">↓</button>` : ''}
             <button class="btn-sm btn-red" data-rm="${i}" title="Remove">✕</button></div>`).join('');
         el.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { const i = +b.dataset.up; [files[i - 1], files[i]] = [files[i], files[i - 1]]; drawFiles(); });
         el.querySelectorAll('[data-dn]').forEach(b => b.onclick = () => { const i = +b.dataset.dn; [files[i + 1], files[i]] = [files[i], files[i + 1]]; drawFiles(); });
         el.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { files.splice(+b.dataset.rm, 1); splitPdf = null; drawFiles(); drawOpts(); });
         $('#pt-drop').hidden = !tool.multiple && files.length > 0;
-        if (tool.multiple && files.length) $('#pt-drop').querySelector('b').textContent = 'Add more files';
         ready();
       };
       const drawOpts = () => {
@@ -1776,10 +1804,13 @@ function pdfToolModal(key) {
         } else o.innerHTML = '';
         o.querySelectorAll('input[type=radio]').forEach(r => r.onchange = () => { opt[r.name.slice(3)] = r.value; drawOpts(); });
       };
+      let pagesRun = 0;
       const drawPages = async () => {
+        const run = ++pagesRun; // a newer call (options redrawn) makes this one stop
         try {
           splitPdf = splitPdf || await openPdf(files[0].file);
           const box = $('#pt-pages');
+          if (run !== pagesRun || !box) return;
           box.innerHTML = '';
           for (let n = 1; n <= Math.min(splitPdf.numPages, 80); n++) {
             const c = await renderPdfPage(splitPdf, n, 110);
@@ -1789,18 +1820,19 @@ function pdfToolModal(key) {
             cell.appendChild(c);
             cell.insertAdjacentHTML('beforeend', `<span>${n}</span>`);
             cell.onclick = () => { opt.picked.has(n - 1) ? opt.picked.delete(n - 1) : opt.picked.add(n - 1); cell.classList.toggle('on'); };
-            if (!$('#pt-pages')) return; // dialog closed or mode changed
+            if (run !== pagesRun || !box.isConnected) return; // dialog closed, mode changed or redrawn
             box.appendChild(cell);
           }
         } catch (e) { status(`✕ ${esc(e.message)}`, 'err'); }
       };
-      const addFiles = async list => {
+      const addFiles = async (list, source = null) => {
         status('');
         for (const file of list) {
           if (!tool.multiple && files.length) files.length = 0;
           const isPdf = /\.pdf$/i.test(file.name) || file.type === 'application/pdf';
-          if (key === 'img2pdf' ? !/^image\/(jpeg|png|webp)$/.test(file.type) : !isPdf) { status(`✕ "${esc(file.name)}" is not a ${key === 'img2pdf' ? 'JPG/PNG/WEBP image' : 'PDF'}`, 'err'); continue; }
-          const f = { file };
+          const okType = key === 'img2pdf' ? isImageFile(file) : key === 'merge' ? isPdf || isImageFile(file) : isPdf;
+          if (!okType) { status(`✕ "${esc(file.name)}" is not ${kinds}`, 'err'); continue; }
+          const f = { file, source };
           files.push(f);
           drawFiles();
           try {
@@ -1813,7 +1845,63 @@ function pdfToolModal(key) {
         drawOpts();
       };
       $('#pt-in').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+
+      // ---- documents already in the portal
+      const okMime = it => (key === 'img2pdf' ? /^image\//.test(it.mime || '') : key === 'merge' ? true : it.mime === 'application/pdf');
+      const fetchPortalFile = async it => {
+        const r = await fetch(`/api/items/${it.id}/file`);
+        if (!r.ok) throw new Error(`Could not load "${it.name}" from the portal`);
+        const b = await r.blob();
+        return new File([b], it.original_name || `${baseName(it.name)}.pdf`, { type: it.mime || b.type });
+      };
+      const addFromPortal = async (customer, docs) => {
+        for (const [n, it] of docs.entries()) {
+          status(`<span class="spin"></span> Loading "${esc(it.name)}" from the portal (${n + 1} of ${docs.length})…`);
+          try {
+            await addFiles([await fetchPortalFile(it)], { customerId: customer.id, customerName: customer.full_name, itemId: it.id, itemName: it.name });
+          } catch (e) { status(`✕ ${esc(e.message)}`, 'err'); return; }
+        }
+      };
+      const showPortalDocs = async customer => {
+        const list = $('#pt-pick-docs');
+        list.innerHTML = '<div class="small muted">Loading documents…</div>';
+        try {
+          const docs = (await api('GET', `/api/customers/${customer.id}`)).items.filter(it => it.has_file && okMime(it));
+          if (!docs.length) { list.innerHTML = `<div class="small muted">No ${key === 'img2pdf' ? 'photos' : key === 'merge' ? 'documents' : 'PDF documents'} uploaded for ${esc(customer.full_name)} yet.</div>`; return; }
+          const type = tool.multiple ? 'checkbox' : 'radio';
+          list.innerHTML = docs.map((it, n) => `<label class="pt-doc"><input type="${type}" name="pt-doc" value="${it.id}" ${tool.multiple || n === 0 ? 'checked' : ''}>
+              <div><b>${esc(it.name)}</b><div class="small muted">${esc(it.original_name || '')} · ${STATUS_LABEL[it.status]}</div></div></label>`).join('')
+            + '<div class="toolbar" style="margin-top:8px"><button type="button" class="btn-primary btn-sm" id="pt-pick-add">Add selected</button><button type="button" class="btn-sm" id="pt-pick-x">Cancel</button></div>';
+          $('#pt-pick-x').onclick = () => { $('#pt-pick').hidden = true; };
+          $('#pt-pick-add').onclick = async () => {
+            const ids = [...list.querySelectorAll('input:checked')].map(x => +x.value);
+            if (!ids.length) return toast('Select at least one document', true);
+            $('#pt-pick').hidden = true;
+            await addFromPortal(customer, docs.filter(d => ids.includes(d.id)));
+          };
+        } catch (e) { list.innerHTML = `<div class="hint warn">${esc(e.message)}</div>`; }
+      };
+      $('#pt-portal').onclick = async () => {
+        const box = $('#pt-pick');
+        box.hidden = false;
+        if (state.me.role === 'customer') {
+          box.innerHTML = '<b>Your uploaded documents</b><div id="pt-pick-docs" style="margin-top:8px"></div>';
+          return showPortalDocs({ id: state.me.id, full_name: state.me.full_name });
+        }
+        box.innerHTML = '<div class="small muted">Loading customers…</div>';
+        try {
+          const { users } = await api('GET', '/api/users?role=customer');
+          box.innerHTML = `<div class="field" style="margin-bottom:8px"><label>Customer</label><select id="pt-pick-cu"><option value="">Choose customer…</option>
+            ${users.map(u => `<option value="${u.id}">${esc(u.full_name)}${u.passport_no ? ` · ${esc(u.passport_no)}` : ''}</option>`).join('')}</select></div><div id="pt-pick-docs"></div>`;
+          $('#pt-pick-cu').onchange = e => {
+            const u = users.find(x => x.id === +e.target.value);
+            if (u) showPortalDocs(u); else $('#pt-pick-docs').innerHTML = '';
+          };
+        } catch (e) { box.innerHTML = `<div class="hint warn">${esc(e.message)}</div>`; }
+      };
+
       drawOpts(); drawFiles();
+      if (preset) addFromPortal(preset.customer, preset.docs);
 
       $('#pt-go').onclick = async () => {
         $('#pt-go').disabled = true;
@@ -1853,44 +1941,73 @@ function pdfToolModal(key) {
         };
       };
 
-      // send one result into a customer's checklist item
+      // send one result into a customer's checklist item: an empty item, a new item, or (admin) replace the original
       const checklistPicker = async i => {
         const box = $(`#pt-ck-${i}`);
         box.hidden = false;
         box.innerHTML = '<div class="small muted">Loading…</div>';
-        const isCustomer = state.me.role === 'customer';
-        const loadItems = async cid => (await api('GET', `/api/customers/${cid}`)).items.filter(fillable);
-        const itemSel = list => list.length ? `<select id="pt-it-${i}">${list.map(it => `<option value="${it.id}">${esc(it.name)}${it.status === 'rejected' ? ' (re-upload)' : ''}</option>`).join('')}</select>`
-          : '<span class="small muted">No checklist item is waiting for a document.</span>';
+        const isCustomer = state.me.role === 'customer', isAdmin = state.me.role === 'admin';
+        const sources = files.map(f => f.source).filter(Boolean);
+        const src = sources.length && sources.every(x => x.itemId === sources[0].itemId) && files.length === 1 ? sources[0] : null;
+        const newName = src ? `${src.itemName} (edited)` : baseName(results[i].name).replace(/[_-]+/g, ' ');
+        const drawTargets = async cid => {
+          const items = (await api('GET', `/api/customers/${cid}`)).items;
+          const original = src && src.customerId === +cid ? items.find(it => it.id === src.itemId) : null;
+          const opts = [
+            ...(original && isAdmin && original.has_file ? [`<option value="replace:${original.id}">Replace original: ${esc(original.name)}</option>`] : []),
+            ...items.filter(fillable).map(it => `<option value="${it.id}">${esc(it.name)}${it.status === 'rejected' ? ' (re-upload)' : ''}</option>`),
+            '<option value="new">+ New checklist item…</option>',
+          ];
+          return `<select id="pt-it-${i}">${opts.join('')}</select><input id="pt-nn-${i}" value="${esc(newName)}" placeholder="New item name" hidden>`
+            + (original && !isAdmin && original.has_file ? `<div class="small muted" style="flex-basis:100%">To replace "${esc(original.name)}" itself, press Remove on it in the checklist (the admin approves).</div>` : '');
+        };
+        const bindTargets = () => {
+          const sel = $(`#pt-it-${i}`);
+          if (!sel) return;
+          const sync = () => { $(`#pt-nn-${i}`).hidden = sel.value !== 'new'; $(`#pt-send-${i}`).textContent = sel.value.startsWith('replace:') ? 'Replace' : 'Upload'; armed = false; };
+          sel.onchange = sync;
+          sync();
+        };
+        let armed = false, cid = isCustomer ? state.me.id : src?.customerId || '';
         try {
           if (isCustomer) {
-            box.innerHTML = `<div class="toolbar">${itemSel(await loadItems(state.me.id))}<button class="btn-sm btn-primary" id="pt-send-${i}">Upload</button></div>`;
+            box.innerHTML = `<div class="toolbar">${await drawTargets(cid)}<button class="btn-sm btn-primary" id="pt-send-${i}">Upload</button></div>`;
           } else {
             const { users } = await api('GET', '/api/users?role=customer');
             box.innerHTML = `<div class="toolbar"><select id="pt-cu-${i}"><option value="">Choose customer…</option>
-              ${users.map(u => `<option value="${u.id}">${esc(u.full_name)}${u.passport_no ? ` · ${esc(u.passport_no)}` : ''}</option>`).join('')}</select>
-              <span id="pt-its-${i}"></span><button class="btn-sm btn-primary" id="pt-send-${i}" disabled>Upload</button></div>`;
-            $(`#pt-cu-${i}`).onchange = async e => {
-              const cid = e.target.value;
-              $(`#pt-send-${i}`).disabled = true;
-              $(`#pt-its-${i}`).innerHTML = cid ? '<span class="small muted">Loading…</span>' : '';
-              if (!cid) return;
-              const list = await loadItems(cid);
-              $(`#pt-its-${i}`).innerHTML = itemSel(list);
-              $(`#pt-send-${i}`).disabled = !list.length;
+              ${users.map(u => `<option value="${u.id}" ${u.id === +cid ? 'selected' : ''}>${esc(u.full_name)}${u.passport_no ? ` · ${esc(u.passport_no)}` : ''}</option>`).join('')}</select>
+              <span class="toolbar" id="pt-its-${i}" style="flex:1"></span><button class="btn-sm btn-primary" id="pt-send-${i}" ${cid ? '' : 'disabled'}>Upload</button></div>`;
+            const load = async () => {
+              cid = $(`#pt-cu-${i}`).value;
+              $(`#pt-send-${i}`).disabled = !cid;
+              $(`#pt-its-${i}`).innerHTML = cid ? await drawTargets(cid) : '';
+              bindTargets();
             };
+            $(`#pt-cu-${i}`).onchange = load;
+            if (cid) await load();
           }
           const send = $(`#pt-send-${i}`);
+          bindTargets();
           send.onclick = async () => {
             const sel = $(`#pt-it-${i}`);
-            if (!sel) return;
+            if (!sel || !cid) return;
+            const v = sel.value;
+            if (v.startsWith('replace:') && !armed) { armed = true; send.textContent = 'Click again to replace'; return; }
             send.disabled = true; send.textContent = 'Uploading…';
-            const fd = new FormData();
-            fd.append('file', results[i]);
             try {
-              await api('POST', `/api/items/${sel.value}/upload`, fd);
-              box.innerHTML = `<div class="hint ok">✓ Uploaded to <b>${esc(sel.selectedOptions[0].textContent)}</b> · now In review</div>`;
-            } catch (e) { toast(e.message, true); send.disabled = false; send.textContent = 'Upload'; }
+              let itemId = v, label = sel.selectedOptions[0].textContent;
+              if (v === 'new') {
+                const made = await api('POST', `/api/customers/${cid}/smart-item`, { name: $(`#pt-nn-${i}`).value.trim() || newName });
+                itemId = made.id; label = made.name;
+              } else if (v.startsWith('replace:')) {
+                itemId = v.slice(8); label = label.replace(/^Replace original: /, '');
+                await api('POST', `/api/items/${itemId}/remove`);
+              }
+              const fd = new FormData();
+              fd.append('file', results[i]);
+              await api('POST', `/api/items/${itemId}/upload`, fd);
+              box.innerHTML = `<div class="hint ok">✓ ${v.startsWith('replace:') ? 'Replaced' : 'Uploaded to'} <b>${esc(label)}</b> · now In review</div>`;
+            } catch (e) { toast(e.message, true); send.disabled = false; send.textContent = 'Upload'; armed = false; }
           };
         } catch (e) { box.innerHTML = `<div class="hint warn">${esc(e.message)}</div>`; }
       };
