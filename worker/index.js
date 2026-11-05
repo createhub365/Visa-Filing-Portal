@@ -244,6 +244,20 @@ function pickFields(raw, keys) {
   return out;
 }
 
+// Sort a customer's items by the position of their name in the checklist template.
+// "X – additional" / "X (edited)" sit right after X; items the template does not list keep their order at the end.
+function officialOrder(items, template) {
+  if (!template) return items;
+  const pos = new Map(template.items.map((t, i) => [t.name.toLowerCase(), i]));
+  const base = n => n.toLowerCase().replace(/\s*[–-]\s*additional$/, '').replace(/\s*\(edited\)$/, '');
+  const rank = it => {
+    const n = it.name.toLowerCase();
+    if (pos.has(n)) return pos.get(n);
+    return pos.has(base(it.name)) ? pos.get(base(it.name)) + 0.5 : Number.MAX_SAFE_INTEGER;
+  };
+  return items.map((it, i) => ({ it, i, r: rank(it) })).sort((a, b) => a.r - b.r || a.i - b.i).map(x => x.it);
+}
+
 const checklistLabel = c => `${c.country} · ${c.visa_type} · ${APPLICANT_TYPES[c.applicant_type] || c.applicant_type}`;
 
 async function findTemplate(sb, c) {
@@ -427,14 +441,17 @@ const handlers = {
     must(canAccessCustomer(user, uid), 403, 'Not allowed');
     const row = await sb.one('users', { select: USER_SELECT, id: eq(uid), role: eq('customer') });
     must(row, 404, 'Customer not found');
-    const items = (await sb.select('checklist_items', { select: ITEM_SELECT, customer_id: eq(uid), order: 'id' })).map(itemJson);
+    const template = await findTemplate(sb, row);
+    // official order: the order the admin set in this country's checklist; extra documents after
+    const items = officialOrder((await sb.select('checklist_items', { select: ITEM_SELECT, customer_id: eq(uid), order: 'id' })).map(itemJson), template);
     const req = await sb.one('checklist_requests', {
       select: 'created_at,requester:users!checklist_requests_requested_by_fkey(full_name,role)',
       customer_id: eq(uid), status: eq('pending'),
     });
     const out = {
       customer: userJson(row), items, progress: progressOf(items),
-      checklist_available: !!(await findTemplate(sb, row)),
+      checklist_available: !!template,
+      official_order: !!template,
       checklist_request: req ? { created_at: req.created_at, by_name: req.requester?.full_name ?? null, by_role: req.requester?.role ?? null } : null,
     };
     if (user.role === 'admin' || user.role === 'staff') {
@@ -597,6 +614,7 @@ const handlers = {
           : ' (company registration, GST, business ITR, business and personal bank statements, letter on company letterhead).'),
       '- When a document in the library means the same thing, use the library name EXACTLY as written.',
       '- Keep document names short (max 8 words). Do not repeat documents.',
+      '- List the documents in the order the embassy / VFS checklist for this country asks them to be submitted.',
     ].join('\n');
     const user = [
       `Destination country: ${key.country}`,

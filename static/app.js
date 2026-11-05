@@ -1141,7 +1141,9 @@ async function checklistBuilder(existing, prefill = {}, onSaved) {
         <div><label>4. Pick documents</label><input id="bs" placeholder="Search document types…">
           <div class="pick" id="bpick"></div>
           <div class="toolbar" style="margin-top:8px"><input id="bcustom" placeholder="Custom document name" style="flex:1"><button id="baddc">+ Add custom</button></div></div>
-        <div><label>Documents in this checklist (<span id="bn">0</span>)</label><div class="chosen" id="bchosen"></div></div>
+        <div><label>Documents in this checklist (<span id="bn">0</span>)</label>
+          <div class="small muted" style="margin:-2px 0 6px">Drag ⋮⋮ to put them in the embassy / VFS submission order. PDFs and customer pages follow this order.</div>
+          <div class="chosen" id="bchosen"></div></div>
       </div>`,
     foot: `<button data-close>Cancel</button><button class="btn-primary" id="bsave">Save checklist</button>`,
     onMount: (el, close) => {
@@ -1152,7 +1154,7 @@ async function checklistBuilder(existing, prefill = {}, onSaved) {
         const list = docTypes.filter(d => d.name.toLowerCase().includes(q));
         $('#bpick').innerHTML = list.map(d => `<label><input type="checkbox" data-name="${esc(d.name)}" ${chosen.has(d.name) ? 'checked' : ''}> ${esc(d.name)}</label>`).join('')
           || '<div class="small muted" style="padding:8px">No match. Add it as a custom document below.</div>';
-        $('#bchosen').innerHTML = items.map((it, i) => `<div class="chosen-row${it.fresh ? ' fresh' : ''}"><span class="num">${i + 1}</span>
+        $('#bchosen').innerHTML = items.map((it, i) => `<div class="chosen-row${it.fresh ? ' fresh' : ''}" data-i="${i}"><span class="pt-grip" title="Drag to move">⋮⋮</span><span class="num">${i + 1}</span>
             <div style="flex:1;min-width:0"><div class="nm">${esc(it.name)}</div><input data-desc="${i}" value="${esc(it.description || '')}" placeholder="Instructions (optional)"></div>
             <button class="btn-sm" data-up="${i}" ${i ? '' : 'disabled'} title="Move up">↑</button><button class="btn-sm btn-red" data-rm="${i}" title="Remove">✕</button></div>`).join('')
           || '<div class="empty small">Tick documents on the left to add them here.</div>';
@@ -1168,6 +1170,7 @@ async function checklistBuilder(existing, prefill = {}, onSaved) {
         el.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { items.splice(+b.dataset.rm, 1); draw(); });
         el.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { const i = +b.dataset.up; [items[i - 1], items[i]] = [items[i], items[i - 1]]; draw(); });
         el.querySelectorAll('[data-desc]').forEach(inp => inp.oninput = () => { items[+inp.dataset.desc].description = inp.value; });
+        makeSortable($('#bchosen'), '.chosen-row', '.pt-grip', order => { const copy = order.map(i => items[i]); items.splice(0, items.length, ...copy); draw(); });
       };
       $('#bs').oninput = draw;
       const addCustom = async () => {
@@ -1566,6 +1569,35 @@ function bindMergeAll(root, customer, items) {
   });
 }
 
+// Drag rows by a handle to reorder them (mouse, touch, pen). onDrop gets the rows' data-i values in their new order.
+function makeSortable(list, rowSel, gripSel, onDrop) {
+  list.querySelectorAll(gripSel).forEach(grip => grip.onpointerdown = e => {
+    e.preventDefault();
+    const row = grip.closest(rowSel);
+    const scroller = list.scrollHeight > list.clientHeight + 4 ? list : (list.closest('.modal-body') || document.scrollingElement);
+    try { grip.setPointerCapture(e.pointerId); } catch { /* not supported: moves still reach the handle */ }
+    row.classList.add('dragging');
+    let lastY = e.clientY, raf = 0;
+    const place = () => {
+      const rows = [...list.querySelectorAll(`${rowSel}:not(.dragging)`)];
+      const after = rows.find(r => { const b = r.getBoundingClientRect(); return lastY < b.top + b.height / 2; });
+      if (after !== row.nextElementSibling) list.insertBefore(row, after || null);
+      const box = scroller.getBoundingClientRect(); // keep scrolling while dragging near the edge
+      if (lastY < box.top + 50) scroller.scrollTop -= 12; else if (lastY > box.bottom - 50) scroller.scrollTop += 12;
+      raf = 0;
+    };
+    const move = ev => { lastY = ev.clientY; raf = raf || requestAnimationFrame(place); };
+    const up = () => {
+      grip.removeEventListener('pointermove', move);
+      row.classList.remove('dragging');
+      onDrop([...list.querySelectorAll(rowSel)].map(r => +r.dataset.i));
+    };
+    grip.addEventListener('pointermove', move);
+    grip.addEventListener('pointerup', up, { once: true });
+    grip.addEventListener('pointercancel', up, { once: true });
+  });
+}
+
 // -------------------------------------------------------------- PDF tools --
 // Everything runs in the browser (pdf-lib + pdf.js): files never leave the device until you upload them.
 const LIBS = {
@@ -1789,6 +1821,9 @@ function pdfToolModal(key, preset = null) {
       };
       // ---- file list with fast reordering: drag the ⋮⋮ handle, tap-to-order, smart order, A→Z, reverse
       let tapOrder = null; // array of file objects while "Tap to order" is on
+      const officialPos = new Map(); // portal item id → position in that customer's checklist (server sends official order)
+      (preset?.docs || []).forEach((d, i) => officialPos.set(d.id, i));
+      const hasOfficial = () => files.some(f => f.source && officialPos.has(f.source.itemId));
       const fileLabel = f => (f.source ? f.source.itemName : f.file.name);
       const drawFiles = () => {
         const many = tool.multiple && files.length > 1;
@@ -1798,7 +1833,8 @@ function pdfToolModal(key, preset = null) {
                 <button class="btn-sm btn-primary" data-arr="tapdone">Done</button><button class="btn-sm" data-arr="tapcancel">Cancel</button>`
               : `<span class="small muted">Arrange:</span>
                 <button class="btn-sm" data-arr="tap" title="Tap the documents in the order you want">🔢 Tap to order</button>
-                <button class="btn-sm" data-arr="smart" title="Passport, photo, forms, ID, CV, job letters, education, financial, travel">✨ Smart order</button>
+                ${hasOfficial() ? `<button class="btn-sm" data-arr="official" title="The order set in this country's checklist (embassy / VFS submission order)">📋 Official checklist order</button>` : ''}
+                <button class="btn-sm" data-arr="smart" title="A general visa-file order: passport, photo, forms, ID, CV, job letters, education, financial, travel">✨ General order</button>
                 <button class="btn-sm" data-arr="az">A→Z</button><button class="btn-sm" data-arr="rev">⇅ Reverse</button>`}
           </div>` : '')
           + files.map((f, i) => {
@@ -1824,7 +1860,7 @@ function pdfToolModal(key, preset = null) {
             drawFiles();
           });
         }
-        el.querySelectorAll('.pt-grip').forEach(bindDrag);
+        makeSortable($('#pt-files'), '.pt-file', '.pt-grip', order => setOrder(order.map(i => files[i])));
         $('#pt-drop').hidden = !tool.multiple && files.length > 0;
         ready();
       };
@@ -1838,34 +1874,14 @@ function pdfToolModal(key, preset = null) {
           if (chosen.length) toast(`Order set${chosen.length < files.length ? ` · ${files.length - chosen.length} untapped kept at the end` : ''}`);
           return setOrder([...chosen, ...files.filter(f => !chosen.includes(f))]);
         }
-        if (how === 'smart') { setOrder(smartOrder(files, fileLabel)); return toast('Arranged in visa-file order'); }
+        if (how === 'smart') { setOrder(smartOrder(files, fileLabel)); return toast('Arranged in a general visa-file order'); }
+        if (how === 'official') {
+          const pos = f => (f.source && officialPos.has(f.source.itemId) ? officialPos.get(f.source.itemId) : Number.MAX_SAFE_INTEGER);
+          setOrder(files.map((f, i) => ({ f, i })).sort((a, b) => pos(a.f) - pos(b.f) || a.i - b.i).map(x => x.f));
+          return toast('Arranged in the checklist order');
+        }
         if (how === 'az') return setOrder([...files].sort((a, b) => fileLabel(a).localeCompare(fileLabel(b))));
         if (how === 'rev') return setOrder([...files].reverse());
-      };
-      // drag a row by its ⋮⋮ handle (pointer events: mouse, touch and pen)
-      const bindDrag = grip => grip.onpointerdown = e => {
-        e.preventDefault();
-        const list = $('#pt-files'), row = grip.closest('.pt-file'), scroller = el.querySelector('.modal-body');
-        try { grip.setPointerCapture(e.pointerId); } catch { /* not supported: moves still reach the handle */ }
-        row.classList.add('dragging');
-        let lastY = e.clientY, raf = 0;
-        const place = () => {
-          const rows = [...list.querySelectorAll('.pt-file:not(.dragging)')];
-          const after = rows.find(r => { const b = r.getBoundingClientRect(); return lastY < b.top + b.height / 2; });
-          if (after !== row.nextElementSibling) list.insertBefore(row, after || null);
-          const box = scroller.getBoundingClientRect(); // scroll while dragging near the edge
-          if (lastY < box.top + 50) scroller.scrollTop -= 12; else if (lastY > box.bottom - 50) scroller.scrollTop += 12;
-          raf = 0;
-        };
-        const move = ev => { lastY = ev.clientY; raf = raf || requestAnimationFrame(place); };
-        const up = () => {
-          grip.removeEventListener('pointermove', move);
-          row.classList.remove('dragging');
-          setOrder([...list.querySelectorAll('.pt-file')].map(r => files[+r.dataset.i]));
-        };
-        grip.addEventListener('pointermove', move);
-        grip.addEventListener('pointerup', up, { once: true });
-        grip.addEventListener('pointercancel', up, { once: true });
       };
       const drawOpts = () => {
         const o = $('#pt-opts');
@@ -1957,7 +1973,9 @@ function pdfToolModal(key, preset = null) {
         const list = $('#pt-pick-docs');
         list.innerHTML = '<div class="small muted">Loading documents…</div>';
         try {
-          const docs = (await api('GET', `/api/customers/${customer.id}`)).items.filter(it => it.has_file && okMime(it));
+          const all = (await api('GET', `/api/customers/${customer.id}`)).items;
+          all.forEach((it, i) => officialPos.set(it.id, i));
+          const docs = all.filter(it => it.has_file && okMime(it));
           if (!docs.length) { list.innerHTML = `<div class="small muted">No ${key === 'img2pdf' ? 'photos' : key === 'merge' ? 'documents' : 'PDF documents'} uploaded for ${esc(customer.full_name)} yet.</div>`; return; }
           const type = tool.multiple ? 'checkbox' : 'radio';
           list.innerHTML = docs.map((it, n) => `<label class="pt-doc"><input type="${type}" name="pt-doc" value="${it.id}" ${tool.multiple || n === 0 ? 'checked' : ''}>
